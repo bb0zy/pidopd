@@ -53,7 +53,7 @@ CUDA_VISIBLE_DEVICES=0 python eval/run_eval.py --model /models/your-model
 CUDA_VISIBLE_DEVICES=0,1 python eval/run_eval.py \
   --model /models/your-model --tensor-parallel-size 2 \
   --samples 32 --temperature 0.6 --top-p 1.0 \
-  --batch-size 1 --max-model-len 16384 --max-new-tokens 8192
+  --batch-size 1 --max-model-len 8192 --max-new-tokens 4096
 ```
 
 Transformers 单卡，同样的数据与提示处理：
@@ -65,7 +65,11 @@ CUDA_VISIBLE_DEVICES=0 python eval/run_eval.py \
 
 其他参数：`--data` 可以是单文件或目录；`--limit 5` 取每个文件前 5 题；`--dtype bfloat16` 为默认精度；`--plain-prompt` 适用于无 chat template 的 base model；`--chat-template-kwargs '{"enable_thinking":false}'` 传递模型模板支持的选项。每题固定独立采样 32 次，默认 temperature=0.6、top_p=1.0，temperature 必须大于零。采样参数可按模型调整，比较模型时应保持一致；avg@32 本身不规定具体 temperature。
 
-默认上下文 16384、生成预算 8192；应根据模型真实上下文能力及显存调整。`--batch-size` 控制一次提交的题数，实际 completion 数还需乘以 samples。vLLM 默认显存比例 0.9，可通过 `--gpu-memory-utilization` 调整。Transformers 不自动多卡切分，模型须能装入单 GPU。请直接运行脚本，不使用 torchrun 启动重复评测进程。
+默认总上下文上限为 8192 tokens（输入提示与生成之和），最大生成预算为 4096 tokens；这是本项目数学评测的起始配置，不代表所有题目都需要或足够使用该长度。代码会检查提示长度加完整生成预算，因此默认允许最多 4096 tokens 的输入提示（含聊天模板）。生成遇到结束标记会提前停止，不会强制输出满 4096 tokens。
+
+数学题的长度需求取决于题目、模型及推理方式，复杂 AIME/HMMT 题的长推理可能超过 4096 tokens。评测后查看 `length_finish_rate` 和被截断的逐题输出：若长度上限频繁触发，应提高生成预算并相应调整总上下文；比较模型时应保持预算一致。还需确保设置不超过模型真实上下文能力。
+
+`--batch-size` 控制一次提交的题数，实际 completion 数还需乘以 samples。vLLM 默认显存比例 0.9，可通过 `--gpu-memory-utilization` 调整。当前 Transformers 后端使用 `.to("cuda")` 单卡加载，尚未配置 `device_map="auto"`，因此模型须能装入单 GPU。请直接运行脚本，不使用 torchrun 启动重复评测进程。
 
 ## 输出与指标含义
 
