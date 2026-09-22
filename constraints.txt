@@ -1,0 +1,9 @@
+# User-specified target versions. This is NOT a resolved, tested lockfile.
+# Official vLLM 0.19.1 excludes transformers 5.3.x; see README.md.
+accelerate==1.15.0
+torch==2.10.0+cu128
+transformers==5.3.0
+trl==1.13.0
+vllm==0.19.1
+# Additional LoRA dependency chosen for this migration (not user-provided).
+peft==0.19.0

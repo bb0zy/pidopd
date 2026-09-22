@@ -20,6 +20,11 @@ for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE",
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_ROOT = Path("/models")
+LEGACY_SUFFIX = r"Please reason step by step, and put your final answer within \boxed{}."
+SYSTEM_PROMPT = '''Solve the following math problem step by step.
+The last line of your response should be of the form
+Answer: $Answer (without quotes) where $Answer is the answer to the problem.
+Remember to put your answer on its own line after "Answer:".'''
 
 def arguments():
     p = argparse.ArgumentParser(description=__doc__)
@@ -36,6 +41,7 @@ def arguments():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--limit", type=int, help="First N rows per file")
     p.add_argument("--tensor-parallel-size", type=int, default=1)
+    p.add_argument("--max-num-seqs", type=int, default=32, help="vLLM concurrent sequence ceiling, not sample count")
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     p.add_argument("--dtype", choices=["auto", "bfloat16", "float16", "float32"], default="bfloat16")
     p.add_argument("--warmup", type=int, default=1, help="Untimed warmup calls")
@@ -45,7 +51,7 @@ def arguments():
     p.add_argument("--chat-template-kwargs", default="{}", help='JSON, e.g. {"enable_thinking":true}')
     p.add_argument("--trust-remote-code", action="store_true", help="Allow custom code in local model")
     a = p.parse_args()
-    for name in ("batch_size", "max_model_len", "max_new_tokens", "samples", "tensor_parallel_size"):
+    for name in ("batch_size", "max_model_len", "max_new_tokens", "samples", "tensor_parallel_size", "max_num_seqs"):
         if getattr(a, name) < 1:
             p.error(f"{name} must be positive")
     if a.max_new_tokens >= a.max_model_len:
@@ -134,20 +140,24 @@ def normalize(value):
 
 
 def extract(text):
+    # Ignore completed reasoning blocks before looking for the final answer.
+    text = text.rsplit("</think>", 1)[-1]
+    matches = re.findall(r"^[ \t]*(?:Answer|Final answer|答案)[ \t]*[:：][ \t]*([^\r\n]+)",
+                         text, re.I | re.M)
+    if matches:
+        answer = matches[-1].strip().rstrip(".。")
+        return boxed(answer) if boxed(answer) is not None else answer
     answer = boxed(text)
     if answer is not None:
         return answer
     # Never take an arbitrary last number from a chain of thought.
-    matches = re.findall(r"(?:final answer|答案)\s*[:：]\s*([^\n]+)", text, re.I)
-    if matches:
-        return matches[-1].strip().rstrip(".。")
     if re.fullmatch(r"\s*[+-]?\d+(?:\.\d+|/\d+)?\s*", text):
         return text.strip()
     return None
 
 
 def prepare(row, a, tokenizer):
-    from trl import apply_chat_template
+    from trl.data_utils import apply_chat_template
 
     prompt = choose(row, a.prompt_key, ["prompt", "messages", "problem", "question"])
     gold = choose(row, a.answer_key, ["reward_model.ground_truth", "answer", "ground_truth", "target"])
@@ -169,17 +179,27 @@ def prepare(row, a, tokenizer):
         raise ValueError("Only text system/user/assistant messages are supported")
     if messages[-1]["role"] != "user":
         raise ValueError("Prompt must end with user, not a reference assistant answer")
-    if r"\boxed" not in messages[-1]["content"]:
-        messages[-1]["content"] += r" Please reason step by step, and put your final answer within \boxed{}."
+    # All 90 local AIME/HMMT rows contain this exact instruction suffix.
+    # Remove only that suffix, never arbitrary mathematical boxed expressions.
+    question = messages[-1]["content"].strip()
+    if question.endswith(LEGACY_SUFFIX):
+        question = question[:-len(LEGACY_SUFFIX)].rstrip()
+    if not question:
+        raise ValueError("Empty question after removing the legacy instruction")
+    messages[-1]["content"] = question
     if a.plain_prompt:
         if len(messages) != 1:
             raise ValueError("plain-prompt supports only one user message")
-        rendered = messages[0]["content"]
+        rendered = SYSTEM_PROMPT + "\n\n" + question
         ids = tokenizer.encode(rendered, add_special_tokens=True)
     else:
+        if messages[0]["role"] == "system":
+            messages[0]["content"] = messages[0]["content"].rstrip() + "\n\n" + SYSTEM_PROMPT
+        else:
+            messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
         if not tokenizer.chat_template:
             raise ValueError("Local tokenizer has no chat template; use --plain-prompt for base models")
-        rendered = apply_chat_template({"prompt": messages}, tokenizer, **a.template_kwargs)["prompt"]
+        rendered = apply_chat_template({"prompt": messages}, processing_class=tokenizer, **a.template_kwargs)["prompt"]
         ids = tokenizer.encode(rendered, add_special_tokens=False)
     if not ids or len(ids) + a.max_new_tokens > a.max_model_len:
         raise ValueError(f"Prompt length {len(ids)} + generation budget exceeds {a.max_model_len}; increase context or reduce budget")
@@ -195,9 +215,14 @@ class VLLMBackend:
         self.model = LLM(model=str(a.model), tokenizer=str(a.model), dtype=a.dtype,
                          trust_remote_code=a.trust_remote_code,
                          tensor_parallel_size=a.tensor_parallel_size,
+                         max_num_seqs=a.max_num_seqs,
                          gpu_memory_utilization=a.gpu_memory_utilization,
                          max_model_len=a.max_model_len, seed=a.seed,
                          enable_prefix_caching=False, generation_config="vllm")
+        scheduler = self.model.llm_engine.vllm_config.scheduler_config
+        self.engine_settings = {"max_num_seqs": scheduler.max_num_seqs,
+                                "max_num_batched_tokens": scheduler.max_num_batched_tokens}
+        print(f"vLLM scheduler: {self.engine_settings}", flush=True)
 
     def generate(self, batch):
         outputs = self.model.generate([{"prompt_token_ids": r["ids"]} for r in batch],
@@ -214,7 +239,7 @@ class TransformersBackend:
         dtype = "auto" if a.dtype == "auto" else getattr(torch, a.dtype)
         self.model = AutoModelForCausalLM.from_pretrained(
             str(a.model), local_files_only=True, trust_remote_code=a.trust_remote_code,
-            torch_dtype=dtype).to("cuda").eval()
+            dtype=dtype).to("cuda").eval()
         # Fresh config avoids model-supplied sampling/beam defaults.
         eos = self.model.generation_config.eos_token_id
         if eos is None:
@@ -255,15 +280,22 @@ def main():
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires a CUDA GPU")
     versions = {}
-    for package in ("torch", "vllm", "transformers", "trl", "pyarrow"):
+    for package in ("torch", "accelerate", "vllm", "transformers", "trl", "peft", "pyarrow"):
         try:
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
             versions[package] = None
-    if a.backend == "vllm" and versions["vllm"] != "0.23.0":
-        print(f"WARNING: target vLLM is 0.23.0; installed {versions['vllm']}", flush=True)
-    if a.backend == "vllm" and str(versions["torch"]).startswith("2.12"):
-        print("WARNING: official vLLM 0.23.0 pins torch 2.11.0; torch 2.12 needs a compatible custom build.", flush=True)
+    targets = {"torch": "2.10.0+cu128", "accelerate": "1.15.0", "transformers": "5.3.0", "trl": "1.13.0"}
+    if a.backend == "vllm":
+        targets["vllm"] = "0.19.1"
+    for package, expected in targets.items():
+        if versions[package] != expected:
+            print(f"WARNING: target {package}={expected}; installed {versions[package]}", flush=True)
+    if torch.version.cuda != "12.8":
+        print(f"WARNING: expected CUDA runtime 12.8; got {torch.version.cuda}", flush=True)
+    if a.backend == "vllm" and str(versions["transformers"]).startswith("5.3."):
+        print("WARNING: official vLLM 0.19.1 excludes Transformers 5.3.x. "
+              "Run check_environment.py --profile vllm on the server; this combination is unverified.", flush=True)
     set_seed(a.seed)
     tokenizer = AutoTokenizer.from_pretrained(str(a.model), local_files_only=True,
                                                trust_remote_code=a.trust_remote_code)
@@ -299,6 +331,9 @@ def main():
     started = time.perf_counter()
     backend = VLLMBackend(a, tokenizer) if a.backend == "vllm" else TransformersBackend(a, tokenizer)
     load_seconds = time.perf_counter() - started
+    if a.backend == "vllm":
+        metadata["vllm_scheduler"] = backend.engine_settings
+        (run_dir / "config.json").write_text(json.dumps(metadata, default=str, ensure_ascii=False, indent=2), encoding="utf-8")
     for _ in range(a.warmup):
         backend.generate(datasets[0][1][:1])
     summary = {"primary_metric": "avg@32", "samples_per_question": a.samples,

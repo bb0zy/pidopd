@@ -1,0 +1,8 @@
+# Core application dependencies; does not install vLLM or PEFT.
+-c constraints.txt
+accelerate
+torch
+transformers
+trl
+pyarrow>=18.0.0
+packaging>=24.0

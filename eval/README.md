@@ -1,27 +1,26 @@
 # 本地 LLM 数学评测
 
-仅编写代码，未在开发机安装、导入、运行或测试任何评测依赖。请在公司 Linux GPU 服务器使用。
+已在开发机安装 pandas/pyarrow 并检查本地数据；没有安装新 GPU 环境或运行模型评测。请在公司 Linux GPU 服务器使用。
 
 默认使用 vLLM 推理，可切换 Transformers 单 GPU 推理；TRL 的 `apply_chat_template` 用于统一对话提示词，Transformers 加载本地 tokenizer。这里评估生成答案质量与离线批处理速度，不进行训练，也不使用 SFT loss 代替答案准确率。
 
 ## 版本与服务器环境
 
-目标环境是 Python 3.12.3、CUDA 12.9、torch 2.12+cu129、vLLM 0.23.0。
-**这组版本不能宣称官方 wheel 直接兼容**：vLLM 0.23.0 的官方 `requirements/cuda.txt` 指定 `torch==2.11.0`，并包含 CUDA 13 相关依赖。保留 torch 2.12+cu129 时，需要公司已有的兼容 vLLM 构建，或依据官方文档针对现有 PyTorch/CUDA 构建、适配及验证。不能仅使用 `--no-deps` 绕过二进制 ABI 冲突。
+目标环境是 accelerate 1.15.0、torch 2.10.0+cu128、Transformers 5.3.0、TRL 1.13.0、vLLM 0.19.1；Python 沿用 3.12.3。Transformers 模型加载使用 `dtype`，TRL 模板调用使用 `trl.data_utils.apply_chat_template(..., processing_class=tokenizer)`。
 
-`requirements.txt` 仅列出应用层 API 版本范围，刻意不安装/替换 torch 或 vLLM；它不是经过运行验证的锁文件。服务器准备兼容基础环境后，再解析这些依赖并确认安装计划不替换基础组件。离线安装需事先准备完整且兼容的 wheel 集合；本项目不提供或下载这些包。新模型若需要 Transformers 5，请另行调整 TRL/Transformers 组合，当前范围不保证支持。
+版本由根目录 `constraints.txt` 统一约束，`eval/requirements.txt` 引用共有依赖，vLLM 单列在 `requirements-vllm.txt`。官方 vLLM 0.19.1 虽依赖 torch 2.10.0，但明确排除 Transformers 5.3.x；因此保留你的目标版本并不意味着这组官方 wheel 可以直接安装或运行。使用服务器实际 wheel 元数据和运行结果确认，不能以 `--no-deps` 当作兼容修复。详见根目录 README；可自行运行 `python check_environment.py --profile vllm`。脚本不自动修改包或回退后端。
 
 官方参考：
 
-- https://github.com/vllm-project/vllm/blob/v0.23.0/requirements/cuda.txt
-- https://docs.vllm.ai/en/v0.23.0/getting_started/installation/gpu/
-- https://huggingface.co/docs/trl/v0.23.0/data_utils
+- https://github.com/vllm-project/vllm/blob/v0.19.1/requirements/cuda.txt
+- https://github.com/vllm-project/vllm/blob/v0.19.1/requirements/common.txt
+- https://github.com/huggingface/trl/blob/v1.13.0/trl/data_utils.py
 
 ## 模型与数据
 
-默认模型目录是项目根目录 `models/model`；通常使用 `--model /absolute/path/to/model` 指定完整本地模型目录，包含 config、tokenizer、权重及其分片。仅支持已合并的完整因果语言模型；不直接加载 LoRA adapter。
+默认模型目录是 `/models/qwen`；通常使用 `--model /absolute/path/to/model` 指定完整本地模型目录，包含 config、tokenizer、权重及其分片。仅支持已合并的完整因果语言模型；不直接加载 LoRA adapter。
 
-默认数据目录固定为项目根目录下的 `dataset/eval`，不受启动工作目录影响；逐文件评测其中 `.parquet`、`.jsonl`、`.json`，不会递归扫描其他目录。已针对当前 AIME/HMMT 文件可见的 `prompt`、`reward_model.ground_truth` 结构编写适配，但未执行 Parquet 解码验证。JSON 必须为记录数组，JSONL 每行一条记录。
+默认数据目录固定为项目根目录下的 `dataset/eval`，不受启动工作目录影响；逐文件评测其中 `.parquet`、`.jsonl`、`.json`，不会递归扫描其他目录。已用 pandas/pyarrow 解码检查本地 AIME24、AIME25 和 HMMT：每个文件 30 条，字段为 `prompt`、`data_source`、`ability`、`reward_model`、`extra_info`。其中 `reward_model` 包含 `ground_truth/style`，`extra_info` 仅有 `index/split`，没有独立纯问题或解题过程字段。JSON 必须为记录数组，JSONL 每行一条记录。数据检查不代表已运行模型评测；评测脚本本身不依赖 pandas。
 
 自动字段选择：
 
@@ -35,7 +34,20 @@
 {"prompt": [{"role": "user", "content": "What is 1+1?"}], "reward_model": {"ground_truth": "2"}}
 ```
 
-提示必须以 user 消息结尾；不会将标准答案附加到提示。缺少 boxed 指令时会追加最终答案格式要求。数据为空、字段错误或超过上下文预算都会明确报错，不静默跳过或截断。
+提示必须以 user 消息结尾；不会将标准答案附加到提示。本地 90 条记录均含固定后缀 `Please reason step by step, and put your final answer within \boxed{}.`，构造提示时只删除该精确后缀，保留题目正文及数学符号；不会修改原始 Parquet 文件。然后添加 system 消息要求逐步推理，并将最后一行写成 `Answer: <答案>`。已有首条 system 消息会保留并追加这些要求；自定义数据的其他格式指令不会被猜测删除，需自行确保不冲突。聊天模板必须支持 system role；`--plain-prompt` 则把同样的指令作为文本前缀，不添加角色标记。数据为空、字段错误或超过上下文预算都会明确报错，不静默跳过或截断。
+
+例如 AIME25 第一题构造成如下消息，再由本地 tokenizer 套用聊天模板：
+
+```text
+system:
+Solve the following math problem step by step.
+The last line of your response should be of the form
+Answer: $Answer (without quotes) where $Answer is the answer to the problem.
+Remember to put your answer on its own line after "Answer:".
+
+user:
+Find the sum of all integer bases $b>9$ for which $17_{b}$ is a divisor of $97_{b}$.
+```
 
 脚本在导入库前强制设置 Hugging Face 离线模式，模型路径必须为存在的本地目录；数据通过本地文件读取，不调用 Hub 下载接口。默认禁止自定义模型代码；只有确有需要时使用 `--trust-remote-code`，该选项允许执行本地模型目录中的代码，其额外行为由该代码决定。
 
@@ -71,6 +83,8 @@ CUDA_VISIBLE_DEVICES=0 python eval/run_eval.py \
 
 `--batch-size` 控制一次提交的题数，实际 completion 数还需乘以 samples。vLLM 默认显存比例 0.9，可通过 `--gpu-memory-utilization` 调整。当前 Transformers 后端使用 `.to("cuda")` 单卡加载，尚未配置 `device_map="auto"`，因此模型须能装入单 GPU。请直接运行脚本，不使用 torchrun 启动重复评测进程。
 
+`--max-num-seqs` 是 vLLM 调度并发序列上限，默认显式设置为 32，不再依赖版本/硬件默认值。它不会改变每题的 32 次采样，也不会限制评测题数。可设为 8 让引擎分批调度；设得更高只有在待处理序列足够、KV cache/token 预算允许时才有用。初始化后打印实际 `max_num_seqs` 和 `max_num_batched_tokens`，并写入 `config.json` 的 `vllm_scheduler`。Transformers 后端不使用这个参数。
+
 ## 输出与指标含义
 
 每次创建独立的 `eval/results/<UTC时间>/`，保存实际参数/软件版本/GPU信息的 `config.json`、每个数据文件的逐题 `*.predictions.jsonl`，以及 `summary.json`。逐题输出包含 prompt、参考答案、完整生成文本、提取答案、正确性、token 数、结束原因。每个批次写入并 flush，失败时已有明细保留；不实现断点续跑。
@@ -84,4 +98,4 @@ CUDA_VISIBLE_DEVICES=0 python eval/run_eval.py \
 
 默认用一题完整生成预热一次（可能耗时较长），`--warmup 0` 可关闭。vLLM 关闭前缀缓存，以减少预热对重复题目的缓存影响。随机种子固定，但不同后端/硬件/批次划分不保证逐 token 一致。比较速度请保持提示、精度、采样参数、生成长度、batch size、硬件一致；不同答案长度仍影响测量。
 
-评分取最后一个完整 `\boxed{...}`，或明确的 `Final answer:` / `答案：`，或仅含数字的回答；绝不从推理正文随意抓最后一个数字。整数、小数、简单分数按精确有理数比较，因此 `023` 与 `23` 一致。其他答案仅做有限格式归一化后的精确匹配，**不提供通用符号代数等价判定**，多解、表达式及复杂 LaTeX 需按任务扩展评分器。未提取出的输出一律判错。
+评分优先取最后一行匹配行首 `Answer:` / `Answer：` 的答案（大小写不敏感，也兼容 `Final answer:` / `答案：`）；若含已闭合的 `</think>`，只检查其后的回答。支持 `Answer: $70$` 以及该行内的 boxed 答案。没有显式答案行时兼容完整 `\boxed{...}` 或仅含数字的回答；绝不从推理正文随意抓最后一个数字。整数、小数、简单分数按精确有理数比较，因此 `023` 与 `23` 一致。其他答案仅做有限格式归一化后的精确匹配，**不提供通用符号代数等价判定**，多解、表达式及复杂 LaTeX 需按任务扩展评分器。未提取出的输出一律判错。
