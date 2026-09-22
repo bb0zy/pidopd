@@ -19,11 +19,11 @@ for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE",
     os.environ[key] = "1"
 
 ROOT = Path(__file__).resolve().parents[1]
-
+MODEL_ROOT = Path("/models")
 
 def arguments():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", type=Path, default=ROOT / "models/model")
+    p.add_argument("--model", type=Path, default=MODEL_ROOT / "qwen")
     p.add_argument("--data", type=Path, default=ROOT / "dataset/eval")
     p.add_argument("--output", type=Path, default=ROOT / "eval/results")
     p.add_argument("--backend", choices=["vllm", "transformers"], default="vllm")
