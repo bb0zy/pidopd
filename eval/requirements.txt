@@ -1,2 +1,3 @@
 -r ../requirements.txt
+math-verify>=0.8.0,<1.0
 # For the vLLM backend, see requirements-vllm.txt and the known conflict in README.

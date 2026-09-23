@@ -11,7 +11,6 @@ import re
 import statistics
 import time
 from datetime import datetime, timezone
-from fractions import Fraction
 
 # Must be set before importing Hugging Face/vLLM libraries, including workers.
 for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE",
@@ -33,11 +32,11 @@ def arguments():
     p.add_argument("--output", type=Path, default=ROOT / "eval/results")
     p.add_argument("--backend", choices=["vllm", "transformers"], default="vllm")
     p.add_argument("--batch-size", type=int, default=2)
-    p.add_argument("--max-model-len", type=int, default=20480)
-    p.add_argument("--max-new-tokens", type=int, default=16384)
-    p.add_argument("--samples", type=int, choices=[32], default=32, help="avg@32 requires 32 completions per question")
+    p.add_argument("--max-model-len", type=int, default=32768)
+    p.add_argument("--max-new-tokens", type=int, default=31744)
+    p.add_argument("--samples", type=int, choices=[16,32], default=32, help="avg@32 requires 32 completions per question")
     p.add_argument("--temperature", type=float, default=0.6)
-    p.add_argument("--top-p", type=float, default=1.0)
+    p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--limit", type=int, help="First N rows per file")
     p.add_argument("--tensor-parallel-size", type=int, default=1)
@@ -121,21 +120,6 @@ def boxed(text):
         if depth == 0:
             return text[start:i]
     return None
-
-
-def normalize(value):
-    s = str(value).strip().strip("$").strip()
-    for token in (r"\left", r"\right", r"\,", r"\!", " ", "\n"):
-        s = s.replace(token, "")
-    if re.fullmatch(r"[+-]?\d{1,3}(,\d{3})+(\.\d+)?", s):
-        s = s.replace(",", "")
-    frac = re.fullmatch(r"\\(?:dfrac|tfrac|frac)\{([+-]?\d+)\}\{([+-]?\d+)\}", s)
-    if frac:
-        s = f"{frac[1]}/{frac[2]}"
-    try:
-        return str(Fraction(s))
-    except (ValueError, ZeroDivisionError):
-        return s
 
 
 def extract(text):
@@ -273,13 +257,14 @@ class TransformersBackend:
 
 def main():
     a = arguments()
+    from answer_grader import AnswerGrader
     import torch
     from transformers import AutoTokenizer, set_seed
 
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires a CUDA GPU")
     versions = {}
-    for package in ("torch", "accelerate", "vllm", "transformers", "trl", "peft", "pyarrow"):
+    for package in ("torch", "accelerate", "vllm", "transformers", "trl", "peft", "pyarrow", "math-verify", "sympy", "latex2sympy2_extended"):
         try:
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
@@ -317,6 +302,7 @@ def main():
         for index, row in enumerate(rows):
             try:
                 item = prepare(row, a, tokenizer)
+                item["grader"] = AnswerGrader(item["gold"])
             except Exception as exc:
                 raise ValueError(f"{path.name}, row {index}: {exc}") from exc
             item["row_index"] = index
@@ -356,7 +342,7 @@ def main():
                     correct = 0
                     for c in completions:
                         answer = extract(c["text"])
-                        c.update(extracted_answer=answer, correct=answer is not None and normalize(answer) == normalize(row["gold"]))
+                        c.update(extracted_answer=answer, **row["grader"].grade(answer))
                         correct += int(c["correct"])
                         failed += int(answer is None)
                         tokens += c["tokens"]
