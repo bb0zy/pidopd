@@ -41,7 +41,6 @@ def arguments():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--limit", type=int, help="First N rows per file")
     p.add_argument("--tensor-parallel-size", type=int, default=1)
-    p.add_argument("--max-num-seqs", type=int, default=32, help="vLLM concurrent sequence ceiling, not sample count")
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     p.add_argument("--dtype", choices=["auto", "bfloat16", "float16", "float32"], default="bfloat16")
     p.add_argument("--warmup", type=int, default=1, help="Untimed warmup calls")
