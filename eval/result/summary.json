@@ -1,0 +1,20 @@
+{
+  "primary_metric": "avg@32",
+  "samples_per_question": 32,
+  "model_load_seconds": 60.582972859963775,
+  "datasets": {
+    "aime24.parquet": {
+      "questions": 30,
+      "completions": 960,
+      "avg@32": 0.46770833333333334,
+      "generation_seconds": 12785.045911138877,
+      "output_tokens": 14416675,
+      "output_tokens_per_second": 1127.6201196461545,
+      "completions_per_second": 0.07508772410145255,
+      "mean_batch_seconds": 852.3363940759251,
+      "median_batch_seconds": 853.1295118052512,
+      "length_finish_rate": 0.05520833333333333,
+      "answer_extraction_failure_rate": 0.05625
+    }
+  }
+}
