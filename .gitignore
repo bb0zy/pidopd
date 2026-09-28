@@ -3,3 +3,4 @@ related_work/dopd.pdf
 eval/results/
 __pycache__/
 train/outputs/
+dataset/train/train-00000-of-00005.parquet
