@@ -1,4 +1,4 @@
-{
+[{
   "primary_metric": "avg@32",
   "samples_per_question": 32,
   "model_load_seconds": 60.582972859963775,
@@ -17,4 +17,44 @@
       "answer_extraction_failure_rate": 0.05625
     }
   }
+},
+{
+  "primary_metric": "avg@32",
+  "samples_per_question": 32,
+  "model_load_seconds": 40.05060864498955,
+  "datasets": {
+    "hmmt_feb.parquet": {
+      "questions": 30,
+      "completions": 960,
+      "avg@32": 0.22083333333333333,
+      "generation_seconds": 15053.044345864997,
+      "output_tokens": 16199006,
+      "output_tokens_per_second": 1076.1282321240085,
+      "completions_per_second": 0.06377447497945542,
+      "mean_batch_seconds": 1003.5362897243332,
+      "median_batch_seconds": 870.7097252919921,
+      "length_finish_rate": 0.030208333333333334,
+      "answer_extraction_failure_rate": 0.03125
+    }
+  }
+},{
+  "primary_metric": "avg@32",
+  "samples_per_question": 32,
+  "model_load_seconds": 227.21202090199222,
+  "datasets": {
+    "aime25.parquet": {
+      "questions": 30,
+      "completions": 960,
+      "avg@32": 0.3489583333333333,
+      "generation_seconds": 14680.004743220023,
+      "output_tokens": 15418301,
+      "output_tokens_per_second": 1050.292644293658,
+      "completions_per_second": 0.0653950742381999,
+      "mean_batch_seconds": 978.6669828813349,
+      "median_batch_seconds": 904.2757216370082,
+      "length_finish_rate": 0.03958333333333333,
+      "answer_extraction_failure_rate": 0.03854166666666667
+    }
+  }
 }
+]
