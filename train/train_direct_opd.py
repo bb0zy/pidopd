@@ -1,4 +1,4 @@
-"""Local-only Direct-OPD top-1 training; no teacher RL or network downloads."""
+"""Local-only top-1 on-policy training with a solution-conditioned reference teacher."""
 from __future__ import annotations
 
 import argparse
@@ -8,7 +8,6 @@ import json
 import math
 import os
 from pathlib import Path
-import random
 import time
 
 for key in ("HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE",
@@ -29,19 +28,24 @@ Answer: $Answer (without quotes) where $Answer is the answer to the problem.
 {question}
 
 Remember to put your answer on its own line after "Answer:".'''
+PRIVILEGED_SUFFIX = "\n\nReference solution (privileged information):\n{solution}\n\nAnswer the original problem."
 
 
 def arguments():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--models-root", type=Path, default=Path("/models"))
-    for name in ("student", "teacher", "teacher-ref"):
+    for name in ("student", "teacher-ref"):
         p.add_argument(f"--{name}", required=True, help="Directory name under models-root, or absolute local path")
-    p.add_argument("--data", type=Path, default=ROOT / "dataset/train/dapo-17k.parquet")
+    p.add_argument("--data", type=Path, nargs="+", default=[
+        ROOT / "dataset/train/train-00000-of-00005.parquet",
+        ROOT / "dataset/train/train-00001-of-00005.parquet"],
+        help="Ordered training Parquet files; each file is read in row order")
     p.add_argument("--output", type=Path, default=ROOT / "train/outputs")
     p.add_argument("--steps", type=int, default=300)
     p.add_argument("--prompts-per-step", type=int, default=64)
-    p.add_argument("--rollouts-per-prompt", type=int, default=4)
+    p.add_argument("--rollouts-per-prompt", type=int, default=1)
     p.add_argument("--max-prompt-tokens", type=int, default=1024)
+    p.add_argument("--max-teacher-prompt-tokens", type=int, default=8192)
     p.add_argument("--max-new-tokens", type=int, default=2048)
     p.add_argument("--learning-rate", type=float, default=1e-6)
     p.add_argument("--alpha", type=float, default=1.0)
@@ -50,19 +54,19 @@ def arguments():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--save-every", type=int, default=20)
     p.add_argument("--student-device", default="cuda:0")
-    p.add_argument("--teacher-device", default="cuda:0")
-    p.add_argument("--teacher-ref-device", default="cuda:0")
+    p.add_argument("--teacher-ref-device", default="cuda:1")
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--lora-alpha", type=int, default=32)
     p.add_argument("--lora-target-modules", nargs="+", default=["q_proj", "k_proj", "v_proj", "o_proj",
                                                                "gate_proj", "up_proj", "down_proj"])
-    p.add_argument("--prompt-key", default="prompt", help="Field holding text or user-ended messages")
-    p.add_argument("--prompt-format", choices=["dapo", "existing"], default="dapo")
+    p.add_argument("--prompt-key", default="problem", help="Field holding text or user-ended messages")
+    p.add_argument("--solution-key", default="solution", help="Teacher-only reference solution field")
+    p.add_argument("--prompt-format", choices=["dapo", "existing"], default="existing")
     p.add_argument("--chat-template-kwargs", default="{}")
     p.add_argument("--trust-remote-code", action="store_true")
     p.add_argument("--resume", type=Path, help="Local checkpoint created by this script")
     a = p.parse_args()
-    for key in ("steps", "prompts_per_step", "rollouts_per_prompt", "max_prompt_tokens", "max_new_tokens", "save_every", "lora_r", "lora_alpha"):
+    for key in ("steps", "prompts_per_step", "rollouts_per_prompt", "max_prompt_tokens", "max_teacher_prompt_tokens", "max_new_tokens", "save_every", "lora_r", "lora_alpha"):
         if getattr(a, key) < 1:
             p.error(f"{key} must be positive")
     for key in ("learning_rate", "alpha", "max_grad_norm"):
@@ -72,14 +76,14 @@ def arguments():
         p.error("Adaptive alpha must start within [0.5, 2.5]")
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         p.error("Single-process implementation: do not use torchrun/DDP/DeepSpeed")
-    for key in ("student", "teacher", "teacher_ref"):
+    for key in ("student", "teacher_ref"):
         path = Path(getattr(a, key)).expanduser()
         path = (path if path.is_absolute() else a.models_root / path).resolve()
         if not (path / "config.json").is_file():
             p.error(f"Missing local model config: {path}")
         setattr(a, key, path)
-    if a.teacher == a.teacher_ref:
-        p.error("Teacher and teacher-ref must be different pre/post-RL checkpoints")
+    if a.prompt_key == a.solution_key:
+        p.error("Prompt and solution fields must be different")
     a.template_kwargs = json.loads(a.chat_template_kwargs)
     if not isinstance(a.template_kwargs, dict) or any(k in a.template_kwargs for k in (
             "tokenize", "add_generation_prompt", "continue_final_message")):
@@ -130,11 +134,22 @@ def load_student(a):
 
 def read_prompts(a, tok):
     import pyarrow.parquet as pq
-    if not a.data.is_file() or a.data.suffix != ".parquet":
-        raise ValueError(f"Expected a local training Parquet file: {a.data}")
-    rows = pq.read_table(a.data).to_pylist()
+    required = {a.prompt_key, a.solution_key}
+    rows, file_rows = [], []
+    if len({path.resolve() for path in a.data}) != len(a.data):
+        raise ValueError("Training data files must be distinct")
+    for path in a.data:
+        if not path.is_file() or path.suffix != ".parquet":
+            raise ValueError(f"Expected a local training Parquet file: {path}")
+        parquet = pq.ParquetFile(path)
+        missing = required - set(parquet.schema_arrow.names)
+        if missing:
+            raise ValueError(f"Missing training data fields in {path}: {sorted(missing)}")
+        part = parquet.read(columns=sorted(required)).to_pylist()
+        file_rows.append({"path": str(path), "rows": len(part)})
+        rows.extend(part)
     encoded = []
-    overlong = 0
+    overlong, teacher_overlong = 0, 0
     for i, row in enumerate(rows):
         value = row.get(a.prompt_key)
         if isinstance(value, str):
@@ -157,6 +172,9 @@ def read_prompts(a, tok):
             if question.endswith(suffix):
                 question = question[:-len(suffix)].rstrip()
             messages[0]["content"] = DAPO_PROMPT.format(question=question)
+        solution = row.get(a.solution_key)
+        if not isinstance(solution, str) or not solution.strip():
+            raise ValueError(f"Row {i}: missing/empty solution field {a.solution_key}")
         text = apply_chat_template({"prompt": messages}, processing_class=tok, **a.template_kwargs)["prompt"]
         ids = tok.encode(text, add_special_tokens=False)
         if not ids:
@@ -164,10 +182,21 @@ def read_prompts(a, tok):
         if len(ids) > a.max_prompt_tokens:
             overlong += 1
             continue
-        encoded.append(ids)
-    if len(encoded) < a.prompts_per_step:
-        raise ValueError(f"Only {len(encoded)} usable prompts for prompts-per-step={a.prompts_per_step}")
-    return encoded, {"source_rows": len(rows), "usable_rows": len(encoded), "overlong_rows": overlong}
+        teacher_messages = [dict(m) for m in messages]
+        teacher_messages[-1]["content"] += PRIVILEGED_SUFFIX.format(solution=solution.strip())
+        teacher_text = apply_chat_template({"prompt": teacher_messages}, processing_class=tok,
+                                           **a.template_kwargs)["prompt"]
+        teacher_ids = tok.encode(teacher_text, add_special_tokens=False)
+        if not teacher_ids:
+            raise ValueError(f"Row {i}: empty tokenized teacher prompt")
+        if len(teacher_ids) > a.max_teacher_prompt_tokens:
+            teacher_overlong += 1
+            continue
+        encoded.append({"student_ids": ids, "teacher_ids": teacher_ids})
+    if not encoded:
+        raise ValueError("No usable prompts remain after length filtering")
+    return encoded, {"files": file_rows, "source_rows": len(rows), "usable_rows": len(encoded),
+                     "overlong_rows": overlong, "teacher_overlong_rows": teacher_overlong}
 
 
 def response_logits(model, ids, prompt_len):
@@ -190,7 +219,8 @@ def rollout(student, prompts, a, tok):
                               eos_token_id=eos, pad_token_id=tok.pad_token_id,
                               bos_token_id=tok.bos_token_id, use_cache=True)
     records = []
-    for ids in prompts:
+    for prompt in prompts:
+        ids = prompt["student_ids"]
         x = torch.tensor([ids], device=a.student_device)
         for _ in range(a.rollouts_per_prompt):
             sequence = student.generate(input_ids=x, attention_mask=torch.ones_like(x),
@@ -202,12 +232,13 @@ def rollout(student, prompts, a, tok):
                     break
             if len(sequence) <= len(ids):
                 raise RuntimeError("Empty student rollout")
-            records.append({"ids": sequence, "prompt_len": len(ids)})
+            records.append({"ids": sequence, "prompt_len": len(ids),
+                            "teacher_ids": prompt["teacher_ids"]})
     return records
 
 
 @torch.no_grad()
-def annotate(records, student, teacher, teacher_ref):
+def annotate(records, student, teacher_ref):
     student.eval()
     reward_sum, token_count = 0.0, 0
     for record in records:
@@ -215,7 +246,9 @@ def annotate(records, student, teacher, teacher_ref):
         logits = response_logits(student, ids, length)
         top1 = logits.argmax(-1).cpu()
         del logits
-        logits = response_logits(teacher, ids, length)
+        privileged_ids = record["teacher_ids"]
+        teacher_sequence = torch.tensor(privileged_ids + ids[length:].tolist())
+        logits = response_logits(teacher_ref, teacher_sequence, len(privileged_ids))
         teacher_lp = selected_log_probs(logits, top1.to(logits.device)).cpu()
         del logits
         logits = response_logits(teacher_ref, ids, length)
@@ -243,14 +276,14 @@ def save_checkpoint(path, student, tok, optimizer, step, alpha, a):
     torch.save({"optimizer": optimizer.state_dict(), "step": step, "alpha": alpha}, path / "training_state.pt")
     (path / "run_arguments.json").write_text(json.dumps(vars(a), default=str, indent=2), encoding="utf-8")
     # Written last so interrupted partial checkpoints are not resumed.
-    (path / "complete.json").write_text(json.dumps({"step": step, "format": "direct-opd-lora-v1"}), encoding="utf-8")
+    (path / "complete.json").write_text(json.dumps({"step": step, "format": "solution-conditioned-sequential-v2"}), encoding="utf-8")
 
 
 def main():
     a = arguments()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU required; no CPU training fallback")
-    for key in ("student_device", "teacher_device", "teacher_ref_device"):
+    for key in ("student_device", "teacher_ref_device"):
         device = torch.device(getattr(a, key))
         if device.type not in {"cuda", "cpu"} or (key == "student_device" and device.type != "cuda"):
             raise ValueError(f"Unsupported {key}: {device}")
@@ -259,7 +292,7 @@ def main():
     if not tok.chat_template:
         raise ValueError("Student tokenizer must include a local chat template")
     # Token probability subtraction requires the same token events and prefixes.
-    for path in (a.teacher, a.teacher_ref):
+    for path in (a.teacher_ref,):
         other = tokenizer_for(path, a)
         if tok.get_vocab() != other.get_vocab():
             raise ValueError(f"Tokenizer token-to-ID mapping differs: {path}. Cross-tokenizer alignment is not implemented.")
@@ -273,22 +306,22 @@ def main():
         if not (a.resume / "complete.json").is_file():
             raise ValueError("Resume checkpoint is incomplete")
         marker = json.loads((a.resume / "complete.json").read_text(encoding="utf-8"))
-        if marker.get("format") != "direct-opd-lora-v1":
-            raise ValueError("Resume requires a LoRA checkpoint; old full-parameter checkpoints are incompatible")
+        if marker.get("format") != "solution-conditioned-sequential-v2":
+            raise ValueError("Resume requires a solution-conditioned checkpoint with sequential sampling")
         previous = json.loads((a.resume / "run_arguments.json").read_text(encoding="utf-8"))
         # Only output, device placement, save frequency and final step can change.
-        flexible = {"resume", "output", "steps", "save_every", "student_device", "teacher_device", "teacher_ref_device"}
+        flexible = {"resume", "output", "steps", "save_every", "student_device", "teacher_ref_device"}
         for key, value in vars(a).items():
             if key not in flexible and previous.get(key) != json.loads(json.dumps(value, default=str)):
                 raise ValueError(f"Resume configuration differs: {key}")
     student = load_student(a)
-    teacher = load_model(a.teacher, a.teacher_device, a)
     teacher_ref = load_model(a.teacher_ref, a.teacher_ref_device, a)
-    for model in (student, teacher, teacher_ref):
+    for model in (student, teacher_ref):
         if model.get_output_embeddings().weight.shape[0] != student.get_output_embeddings().weight.shape[0]:
             raise ValueError("Models must have identical output vocabulary dimensions")
         context = getattr(model.config, "max_position_embeddings", None)
-        if context and a.max_prompt_tokens + a.max_new_tokens > context:
+        prompt_limit = a.max_prompt_tokens if model is student else a.max_teacher_prompt_tokens
+        if context and prompt_limit + a.max_new_tokens > context:
             raise ValueError(f"Training length exceeds model context {context}")
     trainable_parameters = [p for p in student.parameters() if p.requires_grad]
     if not trainable_parameters:
@@ -301,19 +334,27 @@ def main():
         del state
     if start >= a.steps:
         raise ValueError("steps must exceed the resumed step")
+    available_steps = math.ceil(len(prompts) / a.prompts_per_step)
+    final_step = min(a.steps, available_steps)
+    if start >= final_step:
+        raise ValueError("No unused prompts remain after the resumed step")
+    if final_step < a.steps:
+        print(f"Only {len(prompts)} usable prompts: training ends at step {final_step} "
+              f"before requested step {a.steps}, without repeating prompts.", flush=True)
     run_dir = a.output / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
     run_dir.mkdir(parents=True, exist_ok=False)
     metadata = {"arguments": vars(a), "data": data_info, "cuda": torch.version.cuda,
                 "versions": {p: importlib.metadata.version(p) for p in ("torch", "accelerate", "transformers", "trl", "peft", "pyarrow")}}
     (run_dir / "config.json").write_text(json.dumps(metadata, default=str, indent=2), encoding="utf-8")
     with (run_dir / "metrics.jsonl").open("w", encoding="utf-8") as log:
-        for step in range(start, a.steps):
+        for step in range(start, final_step):
             begin = time.perf_counter()
             # Step-indexed RNG makes uninterrupted/resumed runs use the same seeds.
             set_seed(a.seed + step)
-            batch = random.Random(a.seed + step).sample(prompts, a.prompts_per_step)
+            offset = step * a.prompts_per_step
+            batch = prompts[offset:offset + a.prompts_per_step]
             records = rollout(student, batch, a, tok)
-            mean_shift = annotate(records, student, teacher, teacher_ref)
+            mean_shift = annotate(records, student, teacher_ref)
             if not a.fixed_alpha:
                 alpha = update_alpha(alpha, mean_shift)
             student.train()
@@ -347,7 +388,7 @@ def main():
             log.write(json.dumps(metrics) + "\n")
             log.flush()
             print(json.dumps(metrics), flush=True)
-            if (step + 1) % a.save_every == 0 or step + 1 == a.steps:
+            if (step + 1) % a.save_every == 0 or step + 1 == final_step:
                 save_checkpoint(run_dir / f"checkpoint-{step + 1}", student, tok, optimizer, step + 1, alpha, a)
     print(f"Training artifacts: {run_dir}")
 

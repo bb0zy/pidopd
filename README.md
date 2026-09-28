@@ -52,8 +52,8 @@ python eval/run_eval.py --model /models/qwen --max-num-seqs 32
 # Transformers 单卡评测，不导入 vLLM
 python eval/run_eval.py --model /models/qwen --backend transformers
 
-# LoRA 训练：三个本地模型目录由运行时指定
-python train/train_direct_opd.py --student STUDENT_DIR --teacher POST_RL_DIR --teacher-ref PRE_RL_DIR
+# LoRA 训练：同一参考模型分别在原题及附带 solution 的题目上打分
+python train/train_direct_opd.py --student STUDENT_DIR --teacher-ref REF_DIR
 
 # 单独导出合并模型，供 eval 使用
 python train/merge_lora.py --checkpoint train/outputs/RUN/checkpoint-300 --output train/outputs/RUN/merged-300
