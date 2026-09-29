@@ -44,6 +44,9 @@ def arguments():
     p.add_argument("--steps", type=int, default=300)
     p.add_argument("--prompts-per-step", type=int, default=64)
     p.add_argument("--rollouts-per-prompt", type=int, default=1)
+    p.add_argument("--rollout-batch-size", type=int, default=8)
+    p.add_argument("--score-batch-size", type=int, default=4)
+    p.add_argument("--train-microbatch-size", type=int, default=4)
     p.add_argument("--max-prompt-tokens", type=int, default=1024)
     p.add_argument("--max-teacher-prompt-tokens", type=int, default=8192)
     p.add_argument("--max-new-tokens", type=int, default=2048)
@@ -66,7 +69,7 @@ def arguments():
     p.add_argument("--trust-remote-code", action="store_true")
     p.add_argument("--resume", type=Path, help="Local checkpoint created by this script")
     a = p.parse_args()
-    for key in ("steps", "prompts_per_step", "rollouts_per_prompt", "max_prompt_tokens", "max_teacher_prompt_tokens", "max_new_tokens", "save_every", "lora_r", "lora_alpha"):
+    for key in ("steps", "prompts_per_step", "rollouts_per_prompt", "rollout_batch_size", "score_batch_size", "train_microbatch_size", "max_prompt_tokens", "max_teacher_prompt_tokens", "max_new_tokens", "save_every", "lora_r", "lora_alpha"):
         if getattr(a, key) < 1:
             p.error(f"{key} must be positive")
     for key in ("learning_rate", "alpha", "max_grad_norm"):
@@ -199,12 +202,19 @@ def read_prompts(a, tok):
                      "overlong_rows": overlong, "teacher_overlong_rows": teacher_overlong}
 
 
-def response_logits(model, ids, prompt_len):
+def batch_response_logits(model, sequences, prompt_lengths, pad_token_id):
+    """Score right-padded sequences together; return only each real response slice."""
     device = next(model.parameters()).device
-    x = ids.to(device)[None, :]
-    output = model(input_ids=x, attention_mask=torch.ones_like(x), use_cache=False)
-    # Logits at prompt_len-1 predict the first generated token, including EOS.
-    return output.logits[0, prompt_len - 1:-1, :]
+    width = max(len(ids) for ids in sequences)
+    x = torch.full((len(sequences), width), pad_token_id, dtype=torch.long, device=device)
+    attention_mask = torch.zeros_like(x)
+    for i, ids in enumerate(sequences):
+        x[i, :len(ids)] = ids.to(device)
+        attention_mask[i, :len(ids)] = 1
+    logits = model(input_ids=x, attention_mask=attention_mask, use_cache=False).logits
+    # Position prompt_len-1 predicts the first response token, including EOS.
+    return [logits[i, start - 1:len(ids) - 1, :] for i, (ids, start) in
+            enumerate(zip(sequences, prompt_lengths))]
 
 
 @torch.no_grad()
@@ -218,54 +228,75 @@ def rollout(student, prompts, a, tok):
                               temperature=1.0, top_p=1.0, top_k=0,
                               eos_token_id=eos, pad_token_id=tok.pad_token_id,
                               bos_token_id=tok.bos_token_id, use_cache=True)
+    requests = [prompt for prompt in prompts for _ in range(a.rollouts_per_prompt)]
+    requests.sort(key=lambda prompt: len(prompt["student_ids"]))
     records = []
-    for prompt in prompts:
-        ids = prompt["student_ids"]
-        x = torch.tensor([ids], device=a.student_device)
-        for _ in range(a.rollouts_per_prompt):
-            sequence = student.generate(input_ids=x, attention_mask=torch.ones_like(x),
-                                        generation_config=config)[0].cpu()
-            generated = sequence[len(ids):].tolist()
+    for start in range(0, len(requests), a.rollout_batch_size):
+        chunk = requests[start:start + a.rollout_batch_size]
+        width = max(len(prompt["student_ids"]) for prompt in chunk)
+        x = torch.full((len(chunk), width), tok.pad_token_id, dtype=torch.long,
+                       device=a.student_device)
+        attention_mask = torch.zeros_like(x)
+        for i, prompt in enumerate(chunk):
+            ids = prompt["student_ids"]
+            x[i, width - len(ids):] = torch.tensor(ids, device=a.student_device)
+            attention_mask[i, width - len(ids):] = 1
+        sequences = student.generate(input_ids=x, attention_mask=attention_mask,
+                                     generation_config=config).cpu()
+        for i, prompt in enumerate(chunk):
+            generated = sequences[i, width:].tolist()
             for j, token in enumerate(generated):
                 if token in eos_ids:
-                    sequence = sequence[:len(ids) + j + 1]
+                    generated = generated[:j + 1]
                     break
-            if len(sequence) <= len(ids):
+            if not generated:
                 raise RuntimeError("Empty student rollout")
+            ids = prompt["student_ids"]
+            sequence = torch.tensor(ids + generated, dtype=torch.long)
             records.append({"ids": sequence, "prompt_len": len(ids),
                             "teacher_ids": prompt["teacher_ids"]})
     return records
 
 
 @torch.no_grad()
-def annotate(records, student, teacher_ref):
+def annotate(records, student, teacher_ref, a, pad_token_id):
     student.eval()
     reward_sum, token_count = 0.0, 0
-    for record in records:
-        ids, length = record["ids"], record["prompt_len"]
-        logits = response_logits(student, ids, length)
-        top1 = logits.argmax(-1).cpu()
+    ordered = sorted(records, key=lambda r: len(r["teacher_ids"]) + len(r["ids"]) - r["prompt_len"])
+    for start in range(0, len(ordered), a.score_batch_size):
+        chunk = ordered[start:start + a.score_batch_size]
+        sequences = [r["ids"] for r in chunk]
+        lengths = [r["prompt_len"] for r in chunk]
+        logits = batch_response_logits(student, sequences, lengths, pad_token_id)
+        top1 = [item.argmax(-1).cpu() for item in logits]
         del logits
-        privileged_ids = record["teacher_ids"]
-        teacher_sequence = torch.tensor(privileged_ids + ids[length:].tolist())
-        logits = response_logits(teacher_ref, teacher_sequence, len(privileged_ids))
-        teacher_lp = selected_log_probs(logits, top1.to(logits.device)).cpu()
+        privileged_sequences = [torch.tensor(r["teacher_ids"] + r["ids"][r["prompt_len"]:].tolist())
+                                for r in chunk]
+        privileged_lengths = [len(r["teacher_ids"]) for r in chunk]
+        logits = batch_response_logits(teacher_ref, privileged_sequences,
+                                       privileged_lengths, pad_token_id)
+        teacher_lp = [selected_log_probs(item, ids.to(item.device)).cpu()
+                      for item, ids in zip(logits, top1)]
         del logits
-        logits = response_logits(teacher_ref, ids, length)
-        reference_lp = selected_log_probs(logits, top1.to(logits.device)).cpu()
+        logits = batch_response_logits(teacher_ref, sequences, lengths, pad_token_id)
+        reference_lp = [selected_log_probs(item, ids.to(item.device)).cpu()
+                        for item, ids in zip(logits, top1)]
         del logits
         # Context manager restores LoRA for subsequent rollout / student forward.
         # This no-grad base-only pass finishes before any gradient graph is built.
         with student.disable_adapter():
-            logits = response_logits(student, ids, length)
-            anchor_lp = selected_log_probs(logits, ids[length:].to(logits.device)).cpu()
+            logits = batch_response_logits(student, sequences, lengths, pad_token_id)
+            anchor_lp = [selected_log_probs(item, r["ids"][r["prompt_len"]:].to(item.device)).cpu()
+                         for item, r in zip(logits, chunk)]
             del logits
-        shift = teacher_lp - reference_lp
-        if not torch.isfinite(shift).all() or not torch.isfinite(anchor_lp).all():
-            raise FloatingPointError("Non-finite teacher shift or anchor log probability")
-        record.update(top1=top1, shift=shift, anchor_logp=anchor_lp)
-        reward_sum += shift.sum().item()
-        token_count += shift.numel()
+        for record, ids, privileged_lp, ref_lp, anchor in zip(
+                chunk, top1, teacher_lp, reference_lp, anchor_lp):
+            shift = privileged_lp - ref_lp
+            if not torch.isfinite(shift).all() or not torch.isfinite(anchor).all():
+                raise FloatingPointError("Non-finite teacher shift or anchor log probability")
+            record.update(top1=ids, shift=shift, anchor_logp=anchor)
+            reward_sum += shift.sum().item()
+            token_count += shift.numel()
     return reward_sum / token_count
 
 
@@ -310,7 +341,9 @@ def main():
             raise ValueError("Resume requires a solution-conditioned checkpoint with sequential sampling")
         previous = json.loads((a.resume / "run_arguments.json").read_text(encoding="utf-8"))
         # Only output, device placement, save frequency and final step can change.
-        flexible = {"resume", "output", "steps", "save_every", "student_device", "teacher_ref_device"}
+        flexible = {"resume", "output", "steps", "save_every", "student_device",
+                    "teacher_ref_device", "rollout_batch_size", "score_batch_size",
+                    "train_microbatch_size"}
         for key, value in vars(a).items():
             if key not in flexible and previous.get(key) != json.loads(json.dumps(value, default=str)):
                 raise ValueError(f"Resume configuration differs: {key}")
@@ -354,36 +387,46 @@ def main():
             offset = step * a.prompts_per_step
             batch = prompts[offset:offset + a.prompts_per_step]
             records = rollout(student, batch, a, tok)
-            mean_shift = annotate(records, student, teacher_ref)
+            rollout_seconds = time.perf_counter() - begin
+            mean_shift = annotate(records, student, teacher_ref, a, tok.pad_token_id)
+            score_seconds = time.perf_counter() - begin - rollout_seconds
             if not a.fixed_alpha:
                 alpha = update_alpha(alpha, mean_shift)
             student.train()
             optimizer.zero_grad(set_to_none=True)
             policy_sum, kl_sum = 0.0, 0.0
             total_tokens = sum(len(r["ids"]) - r["prompt_len"] for r in records)
-            # One optimizer step for the ENTIRE on-policy rollout batch.
-            for record in records:
-                ids, length = record["ids"], record["prompt_len"]
-                logits = response_logits(student, ids, length)
-                device = logits.device
-                top_lp = selected_log_probs(logits, record["top1"].to(device))
-                sampled_lp = selected_log_probs(logits, ids[length:].to(device))
-                pg, kl = loss_terms(top_lp, sampled_lp, record["shift"].to(device),
-                                    record["anchor_logp"].to(device))
-                weight = (len(ids) - length) / total_tokens
-                loss = weight * (pg + alpha * kl)
+            # Accumulate microbatch gradients, then update once for all rollout tokens.
+            ordered = sorted(records, key=lambda r: len(r["ids"]))
+            for start in range(0, len(ordered), a.train_microbatch_size):
+                chunk = ordered[start:start + a.train_microbatch_size]
+                logits = batch_response_logits(student, [r["ids"] for r in chunk],
+                                               [r["prompt_len"] for r in chunk], tok.pad_token_id)
+                losses = []
+                for record, item in zip(chunk, logits):
+                    ids, length = record["ids"], record["prompt_len"]
+                    device = item.device
+                    top_lp = selected_log_probs(item, record["top1"].to(device))
+                    sampled_lp = selected_log_probs(item, ids[length:].to(device))
+                    pg, kl = loss_terms(top_lp, sampled_lp, record["shift"].to(device),
+                                        record["anchor_logp"].to(device))
+                    weight = (len(ids) - length) / total_tokens
+                    losses.append(weight * (pg + alpha * kl))
+                    policy_sum += pg.detach().item() * weight
+                    kl_sum += kl.detach().item() * weight
+                loss = torch.stack(losses).sum()
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Non-finite loss; no optimizer update performed")
                 loss.backward()
-                policy_sum += pg.detach().item() * weight
-                kl_sum += kl.detach().item() * weight
-                del logits, top_lp, sampled_lp, pg, kl, loss
+                del logits, losses, loss, top_lp, sampled_lp, pg, kl, item
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters, a.max_grad_norm, error_if_nonfinite=True)
             optimizer.step()
             metrics = {"step": step + 1, "policy_loss": policy_sum, "sampled_k3_kl": kl_sum,
                        "mean_top1_shift": mean_shift, "alpha": alpha, "grad_norm": float(grad_norm),
                        "response_tokens": total_tokens, "rollouts": len(records),
                        "mean_response_length": total_tokens / len(records),
+                       "rollout_seconds": rollout_seconds, "score_seconds": score_seconds,
+                       "train_seconds": time.perf_counter() - begin - rollout_seconds - score_seconds,
                        "seconds": time.perf_counter() - begin}
             log.write(json.dumps(metrics) + "\n")
             log.flush()
