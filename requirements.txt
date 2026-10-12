@@ -1,8 +1,15 @@
-# Core application dependencies; does not install vLLM or PEFT.
--c constraints.txt
-accelerate
-torch
-transformers
-trl
+# Shared training and evaluation dependencies. Target environment: Linux / CUDA 12.8.
+accelerate==1.15.0
+torch==2.10.0+cu128
+transformers==5.3.0
+trl==1.13.0
+peft==0.19.0
+datasets
+openai
+wandb
 pyarrow>=18.0.0
 packaging>=24.0
+math-verify>=0.8.0,<1.0
+
+# vLLM requires the server's custom 0.19.1 build compatible with Transformers 5.3.0.
+# Install that build separately; the public vllm==0.19.1 package excludes 5.3.x.

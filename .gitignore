@@ -1,8 +1,11 @@
-dataset/train/dapo-17k.parquet
 related_work/dopd.pdf
 eval/results/
 __pycache__/
+.venv/
+tmp/
+wandb/
 train/outputs/
-dataset/train/train-00000-of-00005.parquet
-dataset/train/train-00001-of-00005.parquet
+train/checkpoint/
 .DS_Store
+dataset/train/
+dataset/eval/

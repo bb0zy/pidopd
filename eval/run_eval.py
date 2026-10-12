@@ -1,4 +1,4 @@
-"""Offline math evaluation. See README.md; no downloads or training."""
+"""Offline math evaluation. See the project root README.md; no downloads or training."""
 from __future__ import annotations
 
 import argparse
@@ -28,6 +28,7 @@ Remember to put your answer on its own line after "Answer:".'''
 def arguments():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", type=Path, default=MODEL_ROOT / "qwen")
+    p.add_argument("--lora-path", type=Path, help="Local LoRA adapter directory, including a training checkpoint")
     p.add_argument("--data", type=Path, default=ROOT / "dataset/eval")
     p.add_argument("--output", type=Path, default=ROOT / "eval/results")
     p.add_argument("--backend", choices=["vllm", "transformers"], default="vllm")
@@ -40,6 +41,7 @@ def arguments():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--limit", type=int, help="First N rows per file")
     p.add_argument("--tensor-parallel-size", type=int, default=1)
+    p.add_argument("--max-num-seqs", type=int, default=32, help="vLLM scheduler concurrency")
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     p.add_argument("--dtype", choices=["auto", "bfloat16", "float16", "float32"], default="bfloat16")
     p.add_argument("--warmup", type=int, default=1, help="Untimed warmup calls")
@@ -68,6 +70,14 @@ def arguments():
     a.data = a.data.expanduser().resolve()
     if not a.model.is_dir() or not (a.model / "config.json").is_file():
         p.error(f"Expected complete local model directory with config.json: {a.model}")
+    a.tokenizer_path = a.model
+    a.lora_rank = None
+    if a.lora_path is not None:
+        a.lora_path = a.lora_path.expanduser().resolve()
+        adapter_config = json.loads((a.lora_path / "adapter_config.json").read_text(encoding="utf-8"))
+        a.lora_rank = max([adapter_config["r"], *adapter_config.get("rank_pattern", {}).values()])
+        if (a.lora_path / "tokenizer_config.json").is_file():
+            a.tokenizer_path = a.lora_path
     if not a.data.exists():
         p.error(f"Local dataset does not exist: {a.data}")
     a.template_kwargs = json.loads(a.chat_template_kwargs)
@@ -193,15 +203,23 @@ class VLLMBackend:
     def __init__(self, a, tokenizer):
         from vllm import LLM, SamplingParams
         self.a = a
+        self.generate_kwargs = {}
+        lora_kwargs = {}
+        if a.lora_path is not None:
+            from vllm.lora.request import LoRARequest
+            # Reserve a supported rank capacity for this adapter, including rank patterns.
+            max_lora_rank = max(8, 1 << (a.lora_rank - 1).bit_length())
+            lora_kwargs = {"enable_lora": True, "max_lora_rank": max_lora_rank}
+            self.generate_kwargs["lora_request"] = LoRARequest(a.lora_path.name, 1, str(a.lora_path))
         self.params = SamplingParams(n=a.samples, temperature=a.temperature,
                                      top_p=a.top_p, max_tokens=a.max_new_tokens)
-        self.model = LLM(model=str(a.model), tokenizer=str(a.model), dtype=a.dtype,
+        self.model = LLM(model=str(a.model), tokenizer=str(a.tokenizer_path), dtype=a.dtype,
                          trust_remote_code=a.trust_remote_code,
                          tensor_parallel_size=a.tensor_parallel_size,
                          max_num_seqs=a.max_num_seqs,
                          gpu_memory_utilization=a.gpu_memory_utilization,
                          max_model_len=a.max_model_len, seed=a.seed,
-                         enable_prefix_caching=False, generation_config="vllm")
+                         enable_prefix_caching=False, generation_config="vllm", **lora_kwargs)
         scheduler = self.model.llm_engine.vllm_config.scheduler_config
         self.engine_settings = {"max_num_seqs": scheduler.max_num_seqs,
                                 "max_num_batched_tokens": scheduler.max_num_batched_tokens}
@@ -209,7 +227,7 @@ class VLLMBackend:
 
     def generate(self, batch):
         outputs = self.model.generate([{"prompt_token_ids": r["ids"]} for r in batch],
-                                      self.params, use_tqdm=False)
+                                      self.params, use_tqdm=False, **self.generate_kwargs)
         return [[{"text": c.text, "tokens": len(c.token_ids),
                   "finish_reason": c.finish_reason} for c in o.outputs] for o in outputs]
 
@@ -223,6 +241,10 @@ class TransformersBackend:
         self.model = AutoModelForCausalLM.from_pretrained(
             str(a.model), local_files_only=True, trust_remote_code=a.trust_remote_code,
             dtype=dtype).to("cuda").eval()
+        if a.lora_path is not None:
+            from peft import PeftModel
+            self.model = PeftModel.from_pretrained(
+                self.model, str(a.lora_path), local_files_only=True, is_trainable=False).eval()
         # Fresh config avoids model-supplied sampling/beam defaults.
         eos = self.model.generation_config.eos_token_id
         if eos is None:
@@ -279,9 +301,9 @@ def main():
         print(f"WARNING: expected CUDA runtime 12.8; got {torch.version.cuda}", flush=True)
     if a.backend == "vllm" and str(versions["transformers"]).startswith("5.3."):
         print("WARNING: official vLLM 0.19.1 excludes Transformers 5.3.x. "
-              "Run check_environment.py --profile vllm on the server; this combination is unverified.", flush=True)
+              "Use the compatible custom build described in the project root README.md.", flush=True)
     set_seed(a.seed)
-    tokenizer = AutoTokenizer.from_pretrained(str(a.model), local_files_only=True,
+    tokenizer = AutoTokenizer.from_pretrained(str(a.tokenizer_path), local_files_only=True,
                                                trust_remote_code=a.trust_remote_code)
     tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None:

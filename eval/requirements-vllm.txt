@@ -1,4 +1,0 @@
-# Target manifest, NOT a solvable official-wheel environment with TF 5.3.0.
-# Keep separate so Transformers-only evaluation and training do not install vLLM.
--r requirements.txt
-vllm
