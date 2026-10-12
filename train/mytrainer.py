@@ -102,7 +102,6 @@ class MyTrainer(SFTTrainer):
         if args.disable_dropout:
             disable_dropout_in_model(self.model)
 
-        self.beta = args.beta
         self.temperature = args.temperature
         generation_kwargs = {
             "max_new_tokens": args.max_new_tokens,
@@ -123,70 +122,6 @@ class MyTrainer(SFTTrainer):
             and self.model.generation_config.eos_token_id is not None
         ):
             self.generation_config.eos_token_id = self.model.generation_config.eos_token_id
-
-    @staticmethod
-    def generalized_jsd_loss(
-        student_logits,
-        teacher_logits,
-        labels=None,
-        beta=0.5,
-        temperature=1.0,
-        reduction="batchmean",
-        num_items_in_batch=None,
-    ):
-        # Apply temperature scaling
-        student_logits = student_logits / temperature
-        teacher_logits = teacher_logits / temperature
-
-        # Compute log probabilities for student and probabilities for teacher
-        student_log_probs = F.log_softmax(student_logits, dim=-1)
-        teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
-
-        if beta == 0:
-            jsd = F.kl_div(student_log_probs, teacher_log_probs, reduction="none", log_target=True)
-        elif beta == 1:
-            jsd = F.kl_div(teacher_log_probs, student_log_probs, reduction="none", log_target=True)
-        else:
-            # Compute the log of the mixture distribution
-            # log(a + b) = log(exp(log(a)) + exp(log(b))) -> for mixture
-            beta = torch.tensor(beta, dtype=student_log_probs.dtype, device=student_log_probs.device)
-            mixture_log_probs = torch.logsumexp(
-                torch.stack([student_log_probs + torch.log1p(-beta), teacher_log_probs + torch.log(beta)]),
-                dim=0,
-            )
-
-            # Compute KL divergences using F.kl_div
-            # PyTorch differs from the standard mathematical definition, so the order of the probability distributions is swapped compared to that defined in the paper.
-            kl_teacher = F.kl_div(mixture_log_probs, teacher_log_probs, reduction="none", log_target=True)
-            kl_student = F.kl_div(mixture_log_probs, student_log_probs, reduction="none", log_target=True)
-
-            # Compute the Generalized Jensen-Shannon Divergence
-            jsd = beta * kl_teacher + (1 - beta) * kl_student
-
-        # Masking
-        if labels is not None:
-            mask = labels != -100
-            jsd = jsd[mask]
-
-        # Apply reduction
-        if num_items_in_batch is not None:
-            # Normalize by the global number of valid tokens for gradient-accumulation-correct loss (see issue #4719).
-            jsd_sum = jsd.sum()
-            if isinstance(num_items_in_batch, torch.Tensor):
-                num_items_in_batch = num_items_in_batch.to(jsd_sum.device)
-            return jsd_sum / num_items_in_batch
-        if reduction == "batchmean":
-            # clamp_min(1) avoids 0/0 -> nan when a sample has no unmasked positions
-            # (e.g. completion fully truncated). jsd[mask] is empty -> jsd.sum() == 0,
-            # so 0/1 == 0 with a valid grad path.
-            denom = mask.sum().clamp_min(1) if labels is not None else max(jsd.size(0), 1)
-            return jsd.sum() / denom
-        elif reduction == "sum":
-            return jsd.sum()
-        elif reduction == "mean":
-            return jsd.mean()
-        else:
-            return jsd
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # Use the same teacher model with normal and privileged prompts.

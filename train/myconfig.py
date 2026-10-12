@@ -11,14 +11,6 @@ class MyConfig(SFTConfig):
         default=0.9,
         metadata={"help": "Temperature for sampling. The higher the temperature, the more random the completions."},
     )
-    beta: float = field(
-        default=0.5,
-        metadata={
-            "help": "Interpolation coefficient between `0.0` and `1.0` of the Generalized Jensen-Shannon Divergence "
-            "loss. When beta is `0.0`, the loss is the KL divergence. When beta is `1.0`, the loss is the Inverse KL "
-            "Divergence."
-        },
-    )
     max_new_tokens: int = field(
         default=2048,
         metadata={"help": "Maximum number of tokens to generate per completion."},
@@ -51,8 +43,3 @@ class MyConfig(SFTConfig):
         },
     )
 
-    def __post_init__(self):
-        super().__post_init__()
-        # Check beta is in the range [0, 1].
-        if self.beta < 0.0 or self.beta > 1.0:
-            raise ValueError("beta must be in the range [0.0, 1.0].")
