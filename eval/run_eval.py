@@ -20,10 +20,8 @@ for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE",
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_ROOT = Path("/models")
 LEGACY_SUFFIX = r"Please reason step by step, and put your final answer within \boxed{}."
-SYSTEM_PROMPT = '''Solve the following math problem step by step.
-The last line of your response should be of the form
-Answer: $Answer (without quotes) where $Answer is the answer to the problem.
-Remember to put your answer on its own line after "Answer:".'''
+SYSTEM_PROMPT = r"""Solve the following math problem step by step.
+The last line of your response should contain only the final answer enclosed in \boxed{}."""
 
 def arguments():
     p = argparse.ArgumentParser(description=__doc__)
@@ -135,14 +133,14 @@ def boxed(text):
 def extract(text):
     # Ignore completed reasoning blocks before looking for the final answer.
     text = text.rsplit("</think>", 1)[-1]
+    answer = boxed(text)
+    if answer is not None:
+        return answer
     matches = re.findall(r"^[ \t]*(?:Answer|Final answer|答案)[ \t]*[:：][ \t]*([^\r\n]+)",
                          text, re.I | re.M)
     if matches:
         answer = matches[-1].strip().rstrip(".。")
         return boxed(answer) if boxed(answer) is not None else answer
-    answer = boxed(text)
-    if answer is not None:
-        return answer
     # Never take an arbitrary last number from a chain of thought.
     if re.fullmatch(r"\s*[+-]?\d+(?:\.\d+|/\d+)?\s*", text):
         return text.strip()
@@ -187,7 +185,7 @@ def prepare(row, a, tokenizer):
         ids = tokenizer.encode(rendered, add_special_tokens=True)
     else:
         if messages[0]["role"] == "system":
-            messages[0]["content"] = messages[0]["content"].rstrip() + "\n\n" + SYSTEM_PROMPT
+            messages[0]["content"] = SYSTEM_PROMPT
         else:
             messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
         if not tokenizer.chat_template:

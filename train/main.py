@@ -24,8 +24,13 @@ if __name__ == "__main__":
     )
     print(train_dataset)
 
-    stu_sys_prompt = ""  # TODO: 填写 student 的 system prompt
-    teacher_sys_prompt = ""  # TODO: 填写 teacher 的 system prompt，solution 会自动追加
+    stu_sys_prompt = r"""Solve the following math problem step by step.
+The last line of your response should contain only the final answer enclosed in \boxed{}."""
+
+    teacher_sys_prompt = stu_sys_prompt + """A reference solution is provided below as additional information.
+Use it to understand the mathematical relationships and the correct result.
+Alternative valid solution methods and wording are equally acceptable.
+Present a self-contained solution without mentioning the reference solution."""
     train_dataset = train_dataset.map(
         prepare_messages,
         fn_kwargs={

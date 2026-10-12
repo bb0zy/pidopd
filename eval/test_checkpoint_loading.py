@@ -65,7 +65,7 @@ class CheckpointLoadingTests(unittest.TestCase):
                 engine.llm_engine.vllm_config.scheduler_config = SimpleNamespace(
                     max_num_seqs=32, max_num_batched_tokens=4096)
                 engine.generate.return_value = [SimpleNamespace(outputs=[SimpleNamespace(
-                    text="Answer: 2", token_ids=[11, 2], finish_reason="stop")])]
+                    text=r"\boxed{2}", token_ids=[11, 2], finish_reason="stop")])]
                 request = MagicMock(side_effect=lambda name, ident, path: SimpleNamespace(
                     lora_name=name, lora_int_id=ident, lora_path=path))
                 modules = {
@@ -76,7 +76,7 @@ class CheckpointLoadingTests(unittest.TestCase):
                     backend = run_eval.VLLMBackend(self.args(adapter), None)
                     for _ in range(2):  # Warmup and evaluation must use the same adapter.
                         result = backend.generate([{"ids": [7, 8]}])
-                        self.assertEqual(result[0][0]["text"], "Answer: 2")
+                        self.assertEqual(result[0][0]["text"], r"\boxed{2}")
                 self.assertEqual(llm.call_args.kwargs["model"], str(self.base.resolve()))
                 if adapter is None:
                     request.assert_not_called()

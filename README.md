@@ -50,6 +50,8 @@ vLLM 使用服务器现有的、兼容 Transformers 5.3.0 的定制版 0.19.1，
 
 在 [train/main.py](train/main.py) 中修改 `model_path`、两个 system prompt、`LoraConfig(...)` 和 `MyConfig(...)`。teacher 服务地址与模型别名的默认值位于 [train/myconfig.py](train/myconfig.py)，也可在 `MyConfig(...)` 中覆盖。训练入口当前不解析命令行参数。
 
+训练与评测使用相同的 student system prompt，仅要求逐步解题，并在最后一行用 `\boxed{...}` 包裹最终答案，不额外要求反思或检查。后续修改 `stu_sys_prompt` 时，同步修改 `eval/run_eval.py` 中的 `SYSTEM_PROMPT`。teacher 在相同提示后追加参考解答的使用说明。
+
 默认读取：
 
 ```text
@@ -164,7 +166,7 @@ Transformers 后端将模型加载到单张 GPU，尚未使用 `device_map="auto
 
 题目默认依次查找 `prompt`、`messages`、`problem`、`question`，答案依次查找 `reward_model.ground_truth`、`answer`、`ground_truth`、`target`。可用 `--prompt-key` 和 `--answer-key` 指定字段，支持点分隔的嵌套路径。
 
-提示必须以 user 消息结尾，不包含参考 assistant 解答。评测删除题目末尾精确匹配的旧指令 `Please reason step by step, and put your final answer within \boxed{}.`，添加要求逐步推理、最后一行输出 `Answer: <答案>` 的 system 提示。已有 system 消息会追加这段要求；原始数据文件不会被修改。
+提示必须以 user 消息结尾，不包含参考 assistant 解答。评测删除题目末尾精确匹配的重复指令 `Please reason step by step, and put your final answer within \boxed{}.`，添加与训练相同的 system 提示，要求逐步推理、最后一行仅输出 `\boxed{最终答案}`。已有首条 system 消息会替换为这段统一提示；原始数据文件不会被修改。
 
 `--plain-prompt` 适合无 chat template 的 base model，将相同指令作为文本前缀；默认使用 TRL 对话模板。可用 `--chat-template-kwargs '{"enable_thinking":false}'` 传递模型模板支持的选项。默认不运行自定义模型代码，需要时显式传入 `--trust-remote-code`。
 
@@ -198,7 +200,7 @@ Transformers 后端将模型加载到单张 GPU，尚未使用 `device_map="auto
 
 计时包括生成、解码和返回结果，排除模型初始化、预热、评分和写文件。`output_tokens_per_second` 是输出 token 总数除以生成计时；批次耗时不是 TTFT 或在线请求延迟。vLLM 关闭前缀缓存。生成遇到 EOS 会提前结束，截断和未提取到答案的样本仍计入准确率分母。
 
-答案提取优先使用最后一个行首 `Answer:`，兼容 `Final answer:`、`答案：`、完整 `\boxed{...}` 和纯数字回答；有已闭合 `</think>` 时只检查其后的文本，不从推理过程随意取数字。
+答案提取优先使用最后一个完整的 `\boxed{...}`，支持嵌套花括号；没有 boxed 答案时兼容旧的 `Answer:`、`Final answer:`、`答案：` 和纯数字回答。有已闭合 `</think>` 时只检查其后的文本，不从推理过程随意取数字。
 
 评分使用 Math-Verify 和 SymPy 判定数学等价，支持分数、根式、π、阶乘和多个解。顶层逗号分隔的多个解按无序列表一对一匹配，缺解或重复解不算正确；括号元组不自动视为无序集合。参考答案带角度标记时允许省略单位，不进行角度/弧度转换。每次解析/比较超时5秒，答案最大2048字符。参考答案不可解析会在加载模型前报错；模型答案缺失、不可解析或异常判错，并记录评分方法或错误信息。
 
