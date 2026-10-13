@@ -20,11 +20,11 @@ class MyConfig(SFTConfig):
         metadata={"help": "Number of student vocabulary candidates used per answer token in the loss."},
     )
     student_model_path: str = field(
-        default="/models/qwen",
+        default="/models/qwen3-1.7b",
         metadata={"help": "Local model directory for the student and its tokenizer."},
     )
     teacher_model_path: str = field(
-        default="/models/qwen",
+        default="/models/qwen3-0.6b",
         metadata={"help": "Local model directory for the frozen Transformers teacher."},
     )
     teacher_gpu: str = field(
