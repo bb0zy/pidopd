@@ -1,6 +1,6 @@
 # pidopd
 
-数学模型的 LoRA 在线训练与离线答案评测。学生通过 Transformers 生成回答，同一个 vLLM teacher 分别使用普通提示和包含参考解答的提示评分；`MyTrainer` 继承 TRL `SFTTrainer`，使用自定义 top-K 加权目标训练。评测支持原始模型、最终 LoRA 和任意中间 checkpoint。
+数学模型的 LoRA 在线训练与离线答案评测。学生通过 Transformers 生成回答，同一个冻结的 Transformers teacher 分别使用普通提示和包含参考解答的提示评分；`MyTrainer` 继承 TRL `SFTTrainer`，使用自定义 top-K 加权目标训练。评测支持原始模型、最终 LoRA 和任意中间 checkpoint，可使用 vLLM 或 Transformers 后端。
 
 所有命令从项目根目录执行，训练和模型评测面向 Linux / NVIDIA GPU 服务器。
 
@@ -13,12 +13,10 @@ train/
   myconfig.py                # Trainer 扩展配置
   mytrainer.py               # 学生生成、自定义 loss、训练步骤
   utils.py                   # 消息准备、tokenization、padding
-  vllm_client.py             # 离线 LLM 教师子进程与候选分数提取
-  test_vllm_client.py        # 无 GPU 的评分位置与候选映射测试
+  teacher_client.py          # Transformers 教师子进程与 GPU 候选评分
+  test_teacher_client.py     # 分块评分对齐与通信测试
   outputs/<model_name>/      # 最终 LoRA 与 tokenizer
   checkpoint/<model_name>/   # checkpoint-<global_step>/
-vllm/
-  start_vllm.sh              # 保留的 HTTP 服务脚本，当前训练不使用
 eval/
   run_eval.py                # 原始模型 / LoRA 评测入口
   answer_grader.py           # 数学答案等价判定
@@ -41,7 +39,7 @@ python -m pip install -r requirements.txt
 python -m pip check
 ```
 
-vLLM 使用服务器现有的、兼容 Transformers 5.3.0 的定制版 0.19.1，单独准备该构建。统一依赖文件用注释记录这一要求，不自动安装公开版 vLLM：公开版的依赖声明排除了 Transformers 5.3.x，直接加入安装清单会产生冲突。[vLLM 0.19.1 依赖声明](https://github.com/vllm-project/vllm/blob/v0.19.1/requirements/common.txt)
+训练不再依赖 vLLM。仅在选择 vLLM 评测后端时，使用服务器现有的、兼容 Transformers 5.3.0 的定制版 0.19.1。统一依赖文件用注释记录这一可选依赖，不自动安装公开版 vLLM：公开版的依赖声明排除了 Transformers 5.3.x，直接加入安装清单会产生冲突。[vLLM 0.19.1 依赖声明](https://github.com/vllm-project/vllm/blob/v0.19.1/requirements/common.txt)
 
 已有可运行的服务器环境无需重复安装。`pip check` 检查声明的依赖关系，不能替代 CUDA 和实际模型运行验证。训练通过 `local_files_only=True` 读取模型；评测额外设置 Hugging Face 离线环境变量，不自动下载模型或数据。
 
@@ -81,7 +79,7 @@ collator 使用同一个 tokenizer 构造两路提示并左侧 padding。`max_le
 
 ### 启动 teacher 与学生
 
-停止旧的 teacher HTTP 服务，直接启动训练。训练脚本自动创建本地教师子进程，在其中实例化 vLLM `LLM`，无需另开服务：
+直接启动训练。训练脚本自动创建本地教师子进程，通过 Transformers 加载冻结模型，无需另开服务：
 
 ```bash
 wandb login
@@ -100,7 +98,9 @@ CUDA_VISIBLE_DEVICES=0 python -m train.main \
 
 学生进程只暴露 GPU0，教师子进程独立设置 `CUDA_VISIBLE_DEVICES=1`，使用 `spawn` 启动，避免与学生的 CUDA 上下文及 Trainer 多卡包装冲突。改变学生卡号时修改启动命令；改变教师卡号时修改 `teacher_gpu`，两者都是机器或容器可见的卡号，不是父进程重映射后的编号。当前训练面向单个学生进程，不使用 `torchrun`。
 
-离线教师默认 `teacher_max_model_len=8192`、`teacher_max_num_seqs=8`、`teacher_gpu_memory_utilization=0.5`，tensor parallel size=1。按学生最多生成2048个 token、离线接口额外生成1个 token 计算，教师提示（含参考解答）可使用最多6143个 token。完整输入加输出必须在上下文预算内，教师模型也需要支持该长度；当前没有对全部数据做 tokenizer 长度验证。原 `vllm/start_vllm.sh` 保留供单独使用，其环境变量不再控制当前训练。
+教师默认 `teacher_max_model_len=8192`、`teacher_score_chunk_size=256`。按学生最多生成2048个 token 计算，教师提示（含参考解答）可使用最多6144个 token；教师只评分，不额外生成 token。超过总长度预算时会报错，不自动截断。教师模型也需要支持该长度。
+
+教师逐条处理 batch 中的输入，每次前向最多256个 token，通过 KV cache 保留前文。`teacher_score_chunk_size` 控制分块大小，可在显存允许时增大以减少前向调用次数；它不改变上下文长度、候选数或 loss。现在没有固定的教师显存比例或预分配 KV cache 配额，显存由模型权重、实际长度的 KV cache 和当前分块 logits 决定。
 
 ### 训练目标与资源开销
 
@@ -113,11 +113,11 @@ r2 = softmax(student_topk_logits.detach()) * r_1
 loss = mean_over_answer_tokens(-sum_over_K(r2 * student_topk_logprob))
 ```
 
-`student_topk_logprob` 来自全词表 `log_softmax`，保留梯度；teacher 差值和权重不保留梯度。教师子进程从 vLLM 的 `FlatLogprobs` 缓冲区直接提取学生指定候选，不逐位置重建全词表字典，也不重建完整 `[长度, 词表]` 分数张量。仅 `[回答长度, K]` 的分数通过本地 Pipe 返回，训练进程相减后将 `r_1` 搬到 GPU。这是实验性目标，loss 可以为负。
+`student_topk_logprob` 来自全词表 `log_softmax`，保留梯度；teacher 差值和权重不保留梯度。教师在 GPU1 上用 `selected_logits - logsumexp(full_vocab_logits)` 得到候选 logprob，全词表归一化保持不变。只把 `[有效回答 token 数, K]` 的 float32 数组通过本地 Pipe 返回，训练进程相减后将 `r_1` 搬到 GPU0。这是实验性目标，loss 可以为负。
 
 学生生成开启 KV cache，`unwrap_model_for_generation` 临时关闭梯度检查点，生成结束后恢复。计算 loss 的学生前向显式关闭 KV cache。teacher 使用固定的基座权重，不随学生更新参数。教师评分期间，学生前向的计算图仍保留在 GPU0 上。
 
-教师使用 `prompt_logprobs=-1`、`flat_logprobs=True`、`detokenize=False`，并跳过 tokenizer 初始化。离线 `generate()` 设 `max_tokens=1`，额外生成的 token 不参与评分。现在不经过 HTTP/JSON；vLLM 内部仍会计算和整理全词表分数，CPU 开销仍需上机验证。当前没有自动过滤超长 teacher 输入，也没有新增计时代码。
+教师使用 `eval()`、冻结参数和 `torch.inference_mode()`，直接进行分块前向，不调用 `generate()`。每块 logits 在 GPU 上提取候选后释放，避免构造完整序列的全词表分数张量，也不把全词表搬到 CPU 或展开成 Python 对象。分块前向与整段前向可能有浮点数值差异，实际 GPU 速度仍需上机验证。没有新增计时代码。
 
 ### 保存与模型命名
 
@@ -209,10 +209,10 @@ Transformers 后端将模型加载到单张 GPU，尚未使用 `device_map="auto
 
 ## 检查
 
-无需模型和 GPU 的离线教师测试，覆盖不同提示长度、候选顺序、重复 token、两路分数差以及只返回候选分数：
+教师测试覆盖跨分块的回答位置、候选顺序、完整前文缓存、全词表归一化、上下文预算和小数组通信。基础测试使用 NumPy 模拟；已安装 Torch 和 Transformers 时，还会在 CPU 上创建随机初始化的小型 Qwen3，比较分块评分与整段前向结果，不下载模型：
 
 ```bash
-python -B -m unittest train.test_vllm_client -v
+python -B -m unittest train.test_teacher_client -v
 ```
 
 无需模型和 GPU 的加载路由测试，覆盖原始模型、最终 adapter、中间 checkpoint、tokenizer 回退和 vLLM rank 容量：

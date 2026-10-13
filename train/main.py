@@ -14,7 +14,7 @@ if __name__ == "__main__":
     from .mytrainer import MyTrainer
     from .utils import prepare_messages
 
-    parser = argparse.ArgumentParser(description="Train with an offline vLLM teacher.")
+    parser = argparse.ArgumentParser(description="Train with a frozen Transformers teacher.")
     for name in ("student_model_path", "teacher_model_path"):
         config_field = MyConfig.__dataclass_fields__[name]
         parser.add_argument(

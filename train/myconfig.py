@@ -25,15 +25,17 @@ class MyConfig(SFTConfig):
     )
     teacher_model_path: str = field(
         default="/models/qwen",
-        metadata={"help": "Local model directory for the frozen offline vLLM teacher."},
+        metadata={"help": "Local model directory for the frozen Transformers teacher."},
     )
     teacher_gpu: str = field(
         default="1",
         metadata={"help": "CUDA_VISIBLE_DEVICES for the teacher process, independent of the student."},
     )
     teacher_max_model_len: int = field(default=8192)
-    teacher_gpu_memory_utilization: float = field(default=0.5)
-    teacher_max_num_seqs: int = field(default=8)
+    teacher_score_chunk_size: int = field(
+        default=256,
+        metadata={"help": "Tokens per cached teacher forward; limits full-vocabulary logits memory."},
+    )
     disable_dropout: bool = field(
         default=True,
         metadata={"help": "Whether to disable dropouts in `model`."},

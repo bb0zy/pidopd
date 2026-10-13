@@ -29,7 +29,7 @@ from trl.trainer.utils import disable_dropout_in_model
 
 from .myconfig import MyConfig
 from .utils import myDataCollator
-from .vllm_client import VLLMClient
+from .teacher_client import TeacherClient
 
 
 if is_peft_available():
@@ -92,19 +92,11 @@ class MyTrainer(SFTTrainer):
         self.model_accepts_loss_kwargs = False
 
         # The frozen teacher runs offline in a separate process on its own GPU.
-        self.teacher_client = VLLMClient(
-            model=teacher_model or args.teacher_model_path,
+        self.teacher_client = TeacherClient(
+            model_path=teacher_model or args.teacher_model_path,
             gpu=args.teacher_gpu,
-            dtype="auto",
-            tensor_parallel_size=1,
-            max_model_len=args.teacher_max_model_len,
-            max_num_seqs=args.teacher_max_num_seqs,
-            gpu_memory_utilization=args.teacher_gpu_memory_utilization,
-            max_logprobs=-1,
-            generation_config="vllm",
-            skip_tokenizer_init=True,
-            enable_prefix_caching=False,
-            disable_log_stats=True,
+            max_length=args.teacher_max_model_len,
+            chunk_size=args.teacher_score_chunk_size,
         )
 
         # Disable dropout in the model
