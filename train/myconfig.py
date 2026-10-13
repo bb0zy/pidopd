@@ -23,6 +23,10 @@ class MyConfig(SFTConfig):
         default="/models/qwen3-1.7b",
         metadata={"help": "Local model directory for the student and its tokenizer."},
     )
+    student_vllm_gpu_memory_utilization: float = field(
+        default=0.5,
+        metadata={"help": "Fraction of the student GPU reserved by vLLM while generating; sleeps during training."},
+    )
     teacher_model_path: str = field(
         default="/models/qwen3-0.6b",
         metadata={"help": "Local model directory for the frozen Transformers teacher."},

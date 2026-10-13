@@ -11,5 +11,5 @@ pyarrow>=18.0.0
 packaging>=24.0
 math-verify>=0.8.0,<1.0
 
-# Optional evaluation backend only: use the custom vLLM 0.19.1 build compatible
-# with Transformers 5.3.0. Training does not require vLLM.
+# Student generation and the optional vLLM evaluation backend require the server's
+# custom vLLM 0.19.1 build compatible with Transformers 5.3.0. Install it separately.

@@ -1,6 +1,4 @@
 
-import random
-import textwrap
 from collections.abc import Callable
 from typing import Any
 
@@ -13,7 +11,6 @@ from transformers import (
     BaseImageProcessor,
     DataCollator,
     FeatureExtractionMixin,
-    GenerationConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
     ProcessorMixin,
@@ -24,12 +21,12 @@ from transformers.utils import is_peft_available
 
 from trl import SFTTrainer
 from trl.experimental.utils import empty_cache
-from trl.models.utils import unwrap_model_for_generation
 from trl.trainer.utils import disable_dropout_in_model
 
 from .myconfig import MyConfig
 from .utils import myDataCollator
 from .teacher_client import TeacherClient
+from .student_generation import StudentGeneration
 
 
 if is_peft_available():
@@ -103,26 +100,9 @@ class MyTrainer(SFTTrainer):
         if args.disable_dropout:
             disable_dropout_in_model(self.model)
 
-        self.temperature = args.temperature
-        generation_kwargs = {
-            "max_new_tokens": args.max_new_tokens,
-            "temperature": args.temperature,
-            "do_sample": True,
-            "top_k": 0,
-            "top_p": 1.0,
-            # unwrap_model_for_generation temporarily disables gradient checkpointing.
-            "use_cache": True,
-            "pad_token_id": self.processing_class.pad_token_id,
-        }
-        self.generation_config = GenerationConfig(**generation_kwargs)
- 
-        self.generation_kwargs = generation_kwargs
-    
-        if (
-            hasattr(self.model.generation_config, "eos_token_id")
-            and self.model.generation_config.eos_token_id is not None
-        ):
-            self.generation_config.eos_token_id = self.model.generation_config.eos_token_id
+        self.student_generation = StudentGeneration(
+            self.model, self.accelerator, self.processing_class, args,
+        )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # Use the same teacher model with normal and privileged prompts.
@@ -181,64 +161,13 @@ class MyTrainer(SFTTrainer):
         # Return loss
         return (loss, student_outputs) if return_outputs else loss
 
-    @staticmethod
-    def generate_on_policy_outputs(model, inputs, generation_config):
-        # Generate output with respect to the prompt-only
-        generated_outputs = model.generate(
-            input_ids=inputs["prompts"],
-            attention_mask=inputs["prompt_attention_mask"],
-            generation_config=generation_config,
-            return_dict_in_generate=True,
-        )
-
-        # Get the generated token IDs
-        generated_tokens = generated_outputs.sequences
-        device = generated_tokens.device
-        prompt_mask = inputs["prompt_attention_mask"]
-        prompt_length = inputs["prompts"].shape[1]
-        completion_ids = generated_tokens[:, prompt_length:]
-
-        # Mask everything after the first EOS token. eos_token_id can be a list of stop tokens (Llama 3),
-        # so match with torch.isin; with no eos id nothing stops early, so keep the whole completion.
-        if generation_config.eos_token_id is None:
-            completion_mask = torch.ones_like(completion_ids)
-        else:
-            is_eos = torch.isin(completion_ids, torch.tensor(generation_config.eos_token_id, device=device))
-            eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
-            eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-            sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
-            completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
-
-        # Pad ids can appear inside real prompt text, so use the prompt mask instead of matching ids
-        new_attention_mask = torch.ones_like(generated_tokens)
-        new_attention_mask[:, prompt_length:] = completion_mask
-        new_attention_mask[:, :prompt_length] = prompt_mask
-
-        new_labels = generated_tokens.clone()
-        new_labels[new_attention_mask == 0] = -100
-
-        # Mask the prompt so only the generated completion contributes to the loss. `generate` echoes
-        # the prompt back as the first `prompt_length` columns, so masking them with -100 matches the
-        # collator convention (`labels[:len(prompt)] = -100`) that `compute_loss` relies on.
-        new_labels[:, :prompt_length] = -100
-
-        return generated_tokens, new_attention_mask, new_labels, completion_ids
+    def generate_on_policy_outputs(self, inputs):
+        return self.student_generation.generate(inputs)
 
     def training_step(
         self, model: nn.Module, inputs: dict[str, torch.Tensor | Any], num_items_in_batch: int | None = None
     ) -> torch.Tensor:
-     
-      
-        with (
-            unwrap_model_for_generation(
-                model,
-                self.accelerator,
-                generation_kwargs=self.generation_kwargs,  # Override model.generation_config with generation_kwargs to fix transformers#42762
-            ) as unwrapped_model
-        ):
-            new_input_ids, new_attention_mask, new_labels, completion_ids = self.generate_on_policy_outputs(
-                unwrapped_model, inputs, self.generation_config
-            )
+        new_input_ids, new_attention_mask, new_labels, completion_ids = self.generate_on_policy_outputs(inputs)
         inputs["input_ids"] = new_input_ids
         inputs["attention_mask"] = new_attention_mask
         inputs["labels"] = new_labels

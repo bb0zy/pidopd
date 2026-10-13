@@ -10,3 +10,4 @@ train/checkpoint/
 dataset/train/train-00000-of-00002.parquet
 dataset/train/train-00001-of-00002.parquet
 dataset/eval/
+dataset/train/dapo-17k.parquet
