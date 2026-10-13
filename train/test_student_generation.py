@@ -41,13 +41,17 @@ ARRAY_TORCH = SimpleNamespace(
 class StudentGenerationTests(unittest.TestCase):
     def setUp(self):
         self.args = SimpleNamespace(
-            student_vllm_gpu_memory_utilization=0.5, max_length=1024,
+            student_vllm_gpu="1", student_vllm_gpu_memory_utilization=0.5, max_length=1024,
             max_new_tokens=2048, per_device_train_batch_size=32, temperature=0.9,
         )
-        self.model = SimpleNamespace(generation_config=SimpleNamespace(eos_token_id=[9, 10]), version=0)
+        self.model = SimpleNamespace(
+            name_or_path="/models/student", generation_config=SimpleNamespace(eos_token_id=[9, 10]), version=0,
+        )
         self.backend = Mock()
         self.factory = Mock(return_value=self.backend)
         self.addCleanup(patch.stopall)
+        self.server = Mock(base_url="http://127.0.0.1:8123", group_port=51217)
+        self.server_factory = patch("train.student_generation.StudentServer", return_value=self.server).start()
         patch.dict("sys.modules", {
             "trl.generation.vllm_generation": SimpleNamespace(VLLMGeneration=self.factory),
             "torch": ARRAY_TORCH,
@@ -63,12 +67,18 @@ class StudentGenerationTests(unittest.TestCase):
     def test_batched_configuration_and_stop_tokens(self):
         options = self.factory.call_args.kwargs
         self.assertIs(options["model"], self.model)
-        self.assertEqual(options["max_num_seqs"], 32)
-        self.assertEqual(options["max_model_length"], 3072)
-        self.assertEqual(options["mode"], "colocate")
-        self.assertTrue(options["enable_sleep_mode"])
+        self.server_factory.assert_called_once_with(
+            model_path="/models/student", gpu="1", memory_utilization=0.5, max_model_len=3072, max_num_seqs=32,
+        )
+        self.server.wait_ready.assert_called_once()
+        self.assertEqual(options["mode"], "server")
+        self.assertEqual(options["server_base_url"], self.server.base_url)
+        self.assertEqual(options["group_port"], self.server.group_port)
+        self.assertFalse(options["enable_sleep_mode"])
         self.assertIsNone(options["logprobs"])
-        self.assertEqual(options["generation_kwargs"], {"detokenize": False, "stop_token_ids": [9, 10]})
+        self.assertEqual(options["generation_kwargs"], {
+            "detokenize": False, "stop_token_ids": [9, 10], "add_special_tokens": False,
+        })
 
     def test_initial_updated_and_resumed_weights_synced_before_each_rollout(self):
         loaded = []
@@ -107,6 +117,18 @@ class StudentGenerationTests(unittest.TestCase):
             self.generator.generate(self.inputs)
         self.backend.generate.assert_not_called()
 
+    def test_initialization_failure_stops_server(self):
+        self.factory.side_effect = RuntimeError("NCCL initialization failed")
+        with self.assertRaisesRegex(RuntimeError, "NCCL initialization failed"):
+            StudentGeneration(self.model, Mock(), SimpleNamespace(pad_token_id=9), self.args)
+        self.server.close.assert_called_once()
+
+    def test_close_releases_communicator_and_server(self):
+        self.generator.close()
+        self.generator.close()
+        self.backend.vllm_client.close_communicator.assert_called_once()
+        self.server.close.assert_called()
+
 
 @unittest.skipUnless(
     all(importlib.util.find_spec(name) for name in ("torch", "trl", "peft")),
@@ -126,14 +148,15 @@ class LoraSyncTests(unittest.TestCase):
         model = get_peft_model(Qwen3ForCausalLM(config), LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj"]))
         backend = VLLMGeneration.__new__(VLLMGeneration)
         backend.model = model
-        backend.mode = "colocate"
-        backend.enable_sleep_mode = True
-        backend.accelerator = SimpleNamespace()
+        backend.mode = "server"
+        backend.enable_sleep_mode = False
+        backend.accelerator = SimpleNamespace(is_main_process=True)
         backend._dist = SimpleNamespace(is_fsdp=False, gather_params=lambda _: nullcontext())
-        backend.llm = Mock()
+        backend._weight_metadata = None
+        backend.vllm_client = Mock()
         copied = {}
-        backend.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights.side_effect = (
-            lambda pairs: copied.update((name, weight.clone()) for name, weight in pairs)
+        backend.vllm_client.update_named_params.side_effect = (
+            lambda metadata, pairs: copied.update((name, weight.clone()) for name, weight in pairs)
         )
         layer = model.base_model.model.model.layers[0].self_attn.q_proj
         original = layer.base_layer.weight.detach().clone()
@@ -147,9 +170,8 @@ class LoraSyncTests(unittest.TestCase):
                 torch.testing.assert_close(copied["model.layers.0.self_attn.q_proj.weight"], expected)
                 torch.testing.assert_close(layer.base_layer.weight, original)
                 self.assertFalse(layer.merged)
-                self.assertFalse(backend._llm_weights_sleeping)
-        self.assertEqual(backend.llm.reset_prefix_cache.call_count, 2)
-        backend.llm.wake_up.assert_called_with(tags=["weights"])
+        self.assertEqual(backend.vllm_client.reset_prefix_cache.call_count, 2)
+        self.assertEqual(backend.vllm_client.update_named_params.call_count, 2)
 
 
 if __name__ == "__main__":

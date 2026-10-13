@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 if __name__ == "__main__":
-    # Spawned teacher processes must not initialize the student's CUDA libraries.
+    # Only GPU0 is visible to training; inference processes independently select GPU1.
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
     from datasets import Dataset
@@ -113,4 +113,7 @@ Present a self-contained solution without mentioning the reference solution."""
         trainer.train()
         trainer.save_model(str(final_model_dir))
     finally:
-        trainer.teacher_client.close()
+        try:
+            trainer.student_generation.close()
+        finally:
+            trainer.teacher_client.close()

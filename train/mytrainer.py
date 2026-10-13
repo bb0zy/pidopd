@@ -88,7 +88,7 @@ class MyTrainer(SFTTrainer):
         # The loss uses a per-micro-batch token mean; let Trainer scale gradient accumulation.
         self.model_accepts_loss_kwargs = False
 
-        # The frozen teacher runs offline in a separate process on its own GPU.
+        # Teacher scoring and the student vLLM server share the inference GPU.
         self.teacher_client = TeacherClient(
             model_path=teacher_model or args.teacher_model_path,
             gpu=args.teacher_gpu,
@@ -100,9 +100,13 @@ class MyTrainer(SFTTrainer):
         if args.disable_dropout:
             disable_dropout_in_model(self.model)
 
-        self.student_generation = StudentGeneration(
-            self.model, self.accelerator, self.processing_class, args,
-        )
+        try:
+            self.student_generation = StudentGeneration(
+                self.model, self.accelerator, self.processing_class, args,
+            )
+        except BaseException:
+            self.teacher_client.close()
+            raise
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # Use the same teacher model with normal and privileged prompts.
@@ -156,7 +160,7 @@ class MyTrainer(SFTTrainer):
         loss = -(r2 * topk_log_probs).sum(dim=-1).mean()
 
         # empty cache
-        empty_cache()
+        # empty_cache()
 
         # Return loss
         return (loss, student_outputs) if return_outputs else loss

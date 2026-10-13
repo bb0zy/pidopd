@@ -23,9 +23,13 @@ class MyConfig(SFTConfig):
         default="/models/qwen3-1.7b",
         metadata={"help": "Local model directory for the student and its tokenizer."},
     )
+    student_vllm_gpu: str = field(
+        default="1",
+        metadata={"help": "CUDA_VISIBLE_DEVICES for the student generation server; shares the inference GPU with the teacher."},
+    )
     student_vllm_gpu_memory_utilization: float = field(
         default=0.5,
-        metadata={"help": "Fraction of the student GPU reserved by vLLM while generating; sleeps during training."},
+        metadata={"help": "Fraction of the inference GPU reserved by vLLM; leave room for teacher scoring."},
     )
     teacher_model_path: str = field(
         default="/models/qwen3-0.6b",

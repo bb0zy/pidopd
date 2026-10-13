@@ -1,4 +1,6 @@
-"""Colocated vLLM rollouts using the current trainable student's weights."""
+"""vLLM rollouts on the inference GPU using the current trainable student's weights."""
+
+from .student_server import StudentServer
 
 
 class StudentGeneration:
@@ -9,23 +11,35 @@ class StudentGeneration:
         if isinstance(eos_ids, int):
             eos_ids = [eos_ids]
         self.pad_token_id = tokenizer.pad_token_id
-        self.backend = VLLMGeneration(
-            model=model,
-            accelerator=accelerator,
-            processing_class=tokenizer,
-            mode="colocate",
-            tensor_parallel_size=1,
-            gpu_memory_utilization=args.student_vllm_gpu_memory_utilization,
-            max_model_length=args.max_length + args.max_new_tokens,
+        self.server = StudentServer(
+            model_path=model.name_or_path,
+            gpu=args.student_vllm_gpu,
+            memory_utilization=args.student_vllm_gpu_memory_utilization,
+            max_model_len=args.max_length + args.max_new_tokens,
             max_num_seqs=args.per_device_train_batch_size,
-            enable_sleep_mode=True,
-            temperature=args.temperature,
-            top_p=1.0,
-            top_k=-1,
-            max_completion_length=args.max_new_tokens,
-            logprobs=None,
-            generation_kwargs={"detokenize": False, "stop_token_ids": eos_ids or []},
         )
+        self.backend = None
+        try:
+            self.server.wait_ready()
+            self.backend = VLLMGeneration(
+                model=model,
+                accelerator=accelerator,
+                processing_class=tokenizer,
+                mode="server",
+                server_base_url=self.server.base_url,
+                group_port=self.server.group_port,
+                server_timeout=10.0,
+                enable_sleep_mode=False,
+                temperature=args.temperature,
+                top_p=1.0,
+                top_k=-1,
+                max_completion_length=args.max_new_tokens,
+                logprobs=None,
+                generation_kwargs={"detokenize": False, "stop_token_ids": eos_ids or [], "add_special_tokens": False},
+            )
+        except BaseException:
+            self.server.close()
+            raise
 
     def generate(self, inputs):
         import torch
@@ -36,14 +50,21 @@ class StudentGeneration:
         ]
         with torch.no_grad():
             # Always copy live weights before generation, including the initial/resumed rollout.
-            # TRL merges LoRA for the copy, unmerges the trainable model and resets prefix caches.
-            # Sleep level 2 discards vLLM weights, so re-sync even within an accumulation step.
+            # TRL merges LoRA, streams GPU0 weights to GPU1 through NCCL, then unmerges
+            # the trainable model and resets prefix caches before accepting new prompts.
             self.backend.sync_weights()
             _, completion_ids, _, _ = self.backend.generate(
                 prompts=prompt_ids, images=None, num_generations=1,
             )
-            # TRL sleeps the engine after generation, freeing its weights/KV cache for training.
         return pack_completions(inputs, completion_ids, self.pad_token_id)
+
+    def close(self):
+        try:
+            if self.backend is not None:
+                self.backend.vllm_client.close_communicator()
+                self.backend = None
+        finally:
+            self.server.close()
 
 
 def pack_completions(inputs, completions, pad_token_id):
