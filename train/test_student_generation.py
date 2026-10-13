@@ -7,8 +7,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
+from requests import HTTPError, Response
 
-from train.student_generation import StudentGeneration, pack_completions
+from train.student_generation import StudentGeneration, pack_completions, reset_prefix_cache
 
 
 class Tensor(np.ndarray):
@@ -41,7 +42,7 @@ ARRAY_TORCH = SimpleNamespace(
 class StudentGenerationTests(unittest.TestCase):
     def setUp(self):
         self.args = SimpleNamespace(
-            student_vllm_gpu="1", student_vllm_gpu_memory_utilization=0.5, max_length=1024,
+            student_vllm_server_url="http://127.0.0.1:8123", student_vllm_group_port=51217, max_length=1024,
             max_new_tokens=2048, per_device_train_batch_size=32, temperature=0.9,
         )
         self.model = SimpleNamespace(
@@ -50,8 +51,6 @@ class StudentGenerationTests(unittest.TestCase):
         self.backend = Mock()
         self.factory = Mock(return_value=self.backend)
         self.addCleanup(patch.stopall)
-        self.server = Mock(base_url="http://127.0.0.1:8123", group_port=51217)
-        self.server_factory = patch("train.student_generation.StudentServer", return_value=self.server).start()
         patch.dict("sys.modules", {
             "trl.generation.vllm_generation": SimpleNamespace(VLLMGeneration=self.factory),
             "torch": ARRAY_TORCH,
@@ -67,13 +66,9 @@ class StudentGenerationTests(unittest.TestCase):
     def test_batched_configuration_and_stop_tokens(self):
         options = self.factory.call_args.kwargs
         self.assertIs(options["model"], self.model)
-        self.server_factory.assert_called_once_with(
-            model_path="/models/student", gpu="1", memory_utilization=0.5, max_model_len=3072, max_num_seqs=32,
-        )
-        self.server.wait_ready.assert_called_once()
         self.assertEqual(options["mode"], "server")
-        self.assertEqual(options["server_base_url"], self.server.base_url)
-        self.assertEqual(options["group_port"], self.server.group_port)
+        self.assertEqual(options["server_base_url"], self.args.student_vllm_server_url)
+        self.assertEqual(options["group_port"], self.args.student_vllm_group_port)
         self.assertFalse(options["enable_sleep_mode"])
         self.assertIsNone(options["logprobs"])
         self.assertEqual(options["generation_kwargs"], {
@@ -117,17 +112,42 @@ class StudentGenerationTests(unittest.TestCase):
             self.generator.generate(self.inputs)
         self.backend.generate.assert_not_called()
 
-    def test_initialization_failure_stops_server(self):
-        self.factory.side_effect = RuntimeError("NCCL initialization failed")
-        with self.assertRaisesRegex(RuntimeError, "NCCL initialization failed"):
-            StudentGeneration(self.model, Mock(), SimpleNamespace(pad_token_id=9), self.args)
-        self.server.close.assert_called_once()
-
-    def test_close_releases_communicator_and_server(self):
+    def test_close_only_releases_communicator(self):
         self.generator.close()
         self.generator.close()
         self.backend.vllm_client.close_communicator.assert_called_once()
-        self.server.close.assert_called()
+
+    def test_cache_reset_compatibility_is_installed_on_this_client(self):
+        client = self.backend.vllm_client
+        client.base_url = self.args.student_vllm_server_url
+        client.reset_prefix_cache()
+        client.session.post.assert_called_once_with("http://127.0.0.1:8123/reset_prefix_cache")
+        client.session.post.return_value.raise_for_status.assert_called_once()
+        client.session.post.return_value.json.assert_not_called()
+
+
+class CacheResetTests(unittest.TestCase):
+    def test_successful_empty_or_text_acknowledgement_needs_no_json(self):
+        for status, body in ((200, b""), (204, b""), (200, b"OK"), (200, b'{"success": true}')):
+            with self.subTest(status=status, body=body):
+                response = Response()
+                response.status_code = status
+                response._content = body
+                response.json = Mock(side_effect=AssertionError("Cache acknowledgement is not JSON"))
+                client = SimpleNamespace(base_url="http://localhost:8000", session=Mock())
+                client.session.post.return_value = response
+                reset_prefix_cache(client)
+                response.json.assert_not_called()
+
+    def test_http_failures_still_propagate(self):
+        for status in (404, 500):
+            with self.subTest(status=status):
+                response = Response()
+                response.status_code = status
+                client = SimpleNamespace(base_url="http://localhost:8000", session=Mock())
+                client.session.post.return_value = response
+                with self.assertRaises(HTTPError):
+                    reset_prefix_cache(client)
 
 
 @unittest.skipUnless(

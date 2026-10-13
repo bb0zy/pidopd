@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 if __name__ == "__main__":
-    # Only GPU0 is visible to training; inference processes independently select GPU1.
+    # Training uses GPU0; the teacher process and manually started vLLM server use GPU1.
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
     from datasets import Dataset
@@ -15,7 +15,7 @@ if __name__ == "__main__":
     from .utils import prepare_messages
 
     parser = argparse.ArgumentParser(description="Train with a frozen Transformers teacher.")
-    for name in ("student_model_path", "teacher_model_path"):
+    for name in ("student_model_path", "teacher_model_path", "student_vllm_server_url"):
         config_field = MyConfig.__dataclass_fields__[name]
         parser.add_argument(
             f"--{name}", f"--{name.replace('_', '-')}",
@@ -85,6 +85,7 @@ Present a self-contained solution without mentioning the reference solution."""
         output_dir=str(checkpoint_dir),
         student_model_path=cli_args.student_model_path,
         teacher_model_path=cli_args.teacher_model_path,
+        student_vllm_server_url=cli_args.student_vllm_server_url,
         teacher_gpu="1",
         per_device_train_batch_size=32,
         gradient_accumulation_steps=1,

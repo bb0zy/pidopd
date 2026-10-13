@@ -23,13 +23,13 @@ class MyConfig(SFTConfig):
         default="/models/qwen3-1.7b",
         metadata={"help": "Local model directory for the student and its tokenizer."},
     )
-    student_vllm_gpu: str = field(
-        default="1",
-        metadata={"help": "CUDA_VISIBLE_DEVICES for the student generation server; shares the inference GPU with the teacher."},
+    student_vllm_server_url: str = field(
+        default="http://127.0.0.1:8000",
+        metadata={"help": "URL of the student vLLM server started with vllm/start_vllm.sh."},
     )
-    student_vllm_gpu_memory_utilization: float = field(
-        default=0.5,
-        metadata={"help": "Fraction of the inference GPU reserved by vLLM; leave room for teacher scoring."},
+    student_vllm_group_port: int = field(
+        default=51216,
+        metadata={"help": "NCCL rendezvous port for student weight synchronization, distinct from the HTTP port."},
     )
     teacher_model_path: str = field(
         default="/models/qwen3-0.6b",

@@ -1,6 +1,12 @@
 """vLLM rollouts on the inference GPU using the current trainable student's weights."""
 
-from .student_server import StudentServer
+from functools import partial
+
+
+def reset_prefix_cache(client):
+    """vLLM may acknowledge cache reset with an empty body rather than JSON."""
+    response = client.session.post(f"{client.base_url}/reset_prefix_cache")
+    response.raise_for_status()
 
 
 class StudentGeneration:
@@ -11,35 +17,26 @@ class StudentGeneration:
         if isinstance(eos_ids, int):
             eos_ids = [eos_ids]
         self.pad_token_id = tokenizer.pad_token_id
-        self.server = StudentServer(
-            model_path=model.name_or_path,
-            gpu=args.student_vllm_gpu,
-            memory_utilization=args.student_vllm_gpu_memory_utilization,
-            max_model_len=args.max_length + args.max_new_tokens,
-            max_num_seqs=args.per_device_train_batch_size,
+        self.backend = VLLMGeneration(
+            model=model,
+            accelerator=accelerator,
+            processing_class=tokenizer,
+            mode="server",
+            server_base_url=args.student_vllm_server_url,
+            group_port=args.student_vllm_group_port,
+            server_timeout=60.0,
+            enable_sleep_mode=False,
+            temperature=args.temperature,
+            top_p=1.0,
+            top_k=-1,
+            max_completion_length=args.max_new_tokens,
+            logprobs=None,
+            generation_kwargs={"detokenize": False, "stop_token_ids": eos_ids or [], "add_special_tokens": False},
         )
-        self.backend = None
-        try:
-            self.server.wait_ready()
-            self.backend = VLLMGeneration(
-                model=model,
-                accelerator=accelerator,
-                processing_class=tokenizer,
-                mode="server",
-                server_base_url=self.server.base_url,
-                group_port=self.server.group_port,
-                server_timeout=10.0,
-                enable_sleep_mode=False,
-                temperature=args.temperature,
-                top_p=1.0,
-                top_k=-1,
-                max_completion_length=args.max_new_tokens,
-                logprobs=None,
-                generation_kwargs={"detokenize": False, "stop_token_ids": eos_ids or [], "add_special_tokens": False},
-            )
-        except BaseException:
-            self.server.close()
-            raise
+        # Patch only this acknowledgement endpoint on this client; JSON generation responses
+        # and weight-transfer responses still use TRL's original parsing/error handling.
+        client = self.backend.vllm_client
+        client.reset_prefix_cache = partial(reset_prefix_cache, client)
 
     def generate(self, inputs):
         import torch
@@ -59,12 +56,10 @@ class StudentGeneration:
         return pack_completions(inputs, completion_ids, self.pad_token_id)
 
     def close(self):
-        try:
-            if self.backend is not None:
-                self.backend.vllm_client.close_communicator()
-                self.backend = None
-        finally:
-            self.server.close()
+        # The shell owns the server process; training only closes its NCCL connection.
+        if self.backend is not None:
+            self.backend.vllm_client.close_communicator()
+            self.backend = None
 
 
 def pack_completions(inputs, completions, pad_token_id):
