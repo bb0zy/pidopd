@@ -13,11 +13,12 @@ train/
   myconfig.py                # Trainer 扩展配置
   mytrainer.py               # 学生生成、自定义 loss、训练步骤
   utils.py                   # 消息准备、tokenization、padding
-  vllm_client.py             # teacher 服务客户端
+  vllm_client.py             # 离线 LLM 教师子进程与候选分数提取
+  test_vllm_client.py        # 无 GPU 的评分位置与候选映射测试
   outputs/<model_name>/      # 最终 LoRA 与 tokenizer
   checkpoint/<model_name>/   # checkpoint-<global_step>/
 vllm/
-  start_vllm.sh              # 独立启动 teacher 服务
+  start_vllm.sh              # 保留的 HTTP 服务脚本，当前训练不使用
 eval/
   run_eval.py                # 原始模型 / LoRA 评测入口
   answer_grader.py           # 数学答案等价判定
@@ -33,7 +34,7 @@ tmp/datasets/                # Datasets 本地缓存
 
 ## 环境与依赖
 
-统一使用根目录 [requirements.txt](requirements.txt)，其中直接固定 Torch、Transformers、TRL、Accelerate 和 PEFT 版本，并包含 Datasets、OpenAI 客户端、W&B、PyArrow 和 Math-Verify。目标 Python 为 3.12.3，Torch 为 `2.10.0+cu128`；安装源需要提供相应 CUDA wheel。
+统一使用根目录 [requirements.txt](requirements.txt)，其中直接固定 Torch、Transformers、TRL、Accelerate 和 PEFT 版本，并包含 Datasets、NumPy、W&B、PyArrow 和 Math-Verify。目标 Python 为 3.12.3，Torch 为 `2.10.0+cu128`；安装源需要提供相应 CUDA wheel。
 
 ```bash
 python -m pip install -r requirements.txt
@@ -48,7 +49,7 @@ vLLM 使用服务器现有的、兼容 Transformers 5.3.0 的定制版 0.19.1，
 
 ### 配置与数据
 
-在 [train/main.py](train/main.py) 中修改 `model_path`、两个 system prompt、`LoraConfig(...)` 和 `MyConfig(...)`。teacher 服务地址与模型别名的默认值位于 [train/myconfig.py](train/myconfig.py)，也可在 `MyConfig(...)` 中覆盖。训练入口当前不解析命令行参数。
+学生与教师模型路径的默认值分别在 [train/myconfig.py](train/myconfig.py) 的 `student_model_path`、`teacher_model_path` 中设置。命令行 `--student_model_path`、`--teacher_model_path` 可分别覆盖默认值，也支持连字符写法 `--student-model-path`、`--teacher-model-path`；修改学生路径不会改变教师路径。两个 system prompt、`LoraConfig(...)` 和其他训练参数在 [train/main.py](train/main.py) 中修改。`teacher_gpu="1"` 指定教师使用的物理卡号；其他教师配置在 `myconfig.py` 中设置，也可在 `MyConfig(...)` 中覆盖。
 
 训练与评测使用相同的 student system prompt，仅要求逐步解题，并在最后一行用 `\boxed{...}` 包裹最终答案，不额外要求反思或检查。后续修改 `stu_sys_prompt` 时，同步修改 `eval/run_eval.py` 中的 `SYSTEM_PROMPT`。teacher 在相同提示后追加参考解答的使用说明。
 
@@ -80,28 +81,30 @@ collator 使用同一个 tokenizer 构造两路提示并左侧 padding。`max_le
 
 ### 启动 teacher 与学生
 
-先在一个终端启动 teacher：
-
-```bash
-VLLM_GPU=1 bash vllm/start_vllm.sh /models/teacher
-```
-
-再在另一个终端启动学生：
+停止旧的 teacher HTTP 服务，直接启动训练。训练脚本自动创建本地教师子进程，在其中实例化 vLLM `LLM`，无需另开服务：
 
 ```bash
 wandb login
 CUDA_VISIBLE_DEVICES=0 python -m train.main
 ```
 
+通过命令行分别指定学生和教师（不传的路径使用 `myconfig.py` 中的默认值）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m train.main \
+  --student_model_path /models/student \
+  --teacher_model_path /models/teacher
+```
+
 当前 `report_to="wandb"`，在线记录需要登录；需要离线记录时可设置 `WANDB_MODE=offline`。项目名可通过 `WANDB_PROJECT` 设置，运行名在 `main.py` 的 `run_name` 中设置。
 
-teacher 启动脚本默认使用 GPU 1、地址 `127.0.0.1`、端口8001、模型别名 `teacher`、上下文上限10240、最大并发8、显存比例0.8、tensor parallel size=1。客户端默认连接 `http://127.0.0.1:8001/v1`。
+学生进程只暴露 GPU0，教师子进程独立设置 `CUDA_VISIBLE_DEVICES=1`，使用 `spawn` 启动，避免与学生的 CUDA 上下文及 Trainer 多卡包装冲突。改变学生卡号时修改启动命令；改变教师卡号时修改 `teacher_gpu`，两者都是机器或容器可见的卡号，不是父进程重映射后的编号。当前训练面向单个学生进程，不使用 `torchrun`。
 
-可通过 `VLLM_GPU`、`VLLM_HOST`、`VLLM_PORT`、`VLLM_MODEL_NAME`、`VLLM_MAX_MODEL_LEN`、`VLLM_MAX_NUM_SEQS`、`VLLM_GPU_MEMORY_UTILIZATION`、`VLLM_TENSOR_PARALLEL_SIZE` 和 `VLLM_DTYPE` 覆盖对应设置；额外 vLLM 参数直接接在模型路径后。修改服务地址或别名时同步修改客户端配置。单卡机器应明确规划 teacher 和 student 的显存分配。
+离线教师默认 `teacher_max_model_len=8192`、`teacher_max_num_seqs=8`、`teacher_gpu_memory_utilization=0.5`，tensor parallel size=1。按学生最多生成2048个 token、离线接口额外生成1个 token 计算，教师提示（含参考解答）可使用最多6143个 token。完整输入加输出必须在上下文预算内，教师模型也需要支持该长度；当前没有对全部数据做 tokenizer 长度验证。原 `vllm/start_vllm.sh` 保留供单独使用，其环境变量不再控制当前训练。
 
 ### 训练目标与资源开销
 
-每个 batch 先由学生生成回答，再用同一个 teacher 对普通上下文和特权上下文分别打分。只在有效回答位置计算：
+每个 batch 先由学生生成回答，再进行带梯度的学生前向，得到每个有效回答位置的 top-K 候选 ID。随后同一个 teacher 对普通上下文和特权上下文分别打分。只在有效回答位置计算：
 
 ```text
 indices = topk(student_logits, K).indices
@@ -110,11 +113,11 @@ r2 = softmax(student_topk_logits.detach()) * r_1
 loss = mean_over_answer_tokens(-sum_over_K(r2 * student_topk_logprob))
 ```
 
-`student_topk_logprob` 来自全词表 `log_softmax`，保留梯度；teacher 差值和权重不保留梯度。两路 teacher 分数在 CPU 上按 student top-K 索引筛选并相减，只有 `[有效回答 token 数, K]` 的 `r_1` 搬到 GPU。这是实验性目标，loss 可以为负。
+`student_topk_logprob` 来自全词表 `log_softmax`，保留梯度；teacher 差值和权重不保留梯度。教师子进程从 vLLM 的 `FlatLogprobs` 缓冲区直接提取学生指定候选，不逐位置重建全词表字典，也不重建完整 `[长度, 词表]` 分数张量。仅 `[回答长度, K]` 的分数通过本地 Pipe 返回，训练进程相减后将 `r_1` 搬到 GPU。这是实验性目标，loss 可以为负。
 
-学生生成开启 KV cache，`unwrap_model_for_generation` 临时关闭梯度检查点，生成结束后恢复。计算 loss 的学生前向显式关闭 KV cache。teacher 由独立服务评分，不随学生更新参数。
+学生生成开启 KV cache，`unwrap_model_for_generation` 临时关闭梯度检查点，生成结束后恢复。计算 loss 的学生前向显式关闭 KV cache。teacher 使用固定的基座权重，不随学生更新参数。教师评分期间，学生前向的计算图仍保留在 GPU0 上。
 
-teacher 的 `score()` 仍通过 HTTP 返回整个输入序列的全词表 logprob，JSON 解析、传输和 CPU 内存可能成为瓶颈。teacher 完整提示加学生回答必须留在服务上下文预算内；当前没有自动过滤超长 teacher 输入。正式训练前可先用较小 batch 和较短生成预算验证一个完整更新步骤。
+教师使用 `prompt_logprobs=-1`、`flat_logprobs=True`、`detokenize=False`，并跳过 tokenizer 初始化。离线 `generate()` 设 `max_tokens=1`，额外生成的 token 不参与评分。现在不经过 HTTP/JSON；vLLM 内部仍会计算和整理全词表分数，CPU 开销仍需上机验证。当前没有自动过滤超长 teacher 输入，也没有新增计时代码。
 
 ### 保存与模型命名
 
@@ -205,6 +208,12 @@ Transformers 后端将模型加载到单张 GPU，尚未使用 `device_map="auto
 评分使用 Math-Verify 和 SymPy 判定数学等价，支持分数、根式、π、阶乘和多个解。顶层逗号分隔的多个解按无序列表一对一匹配，缺解或重复解不算正确；括号元组不自动视为无序集合。参考答案带角度标记时允许省略单位，不进行角度/弧度转换。每次解析/比较超时5秒，答案最大2048字符。参考答案不可解析会在加载模型前报错；模型答案缺失、不可解析或异常判错，并记录评分方法或错误信息。
 
 ## 检查
+
+无需模型和 GPU 的离线教师测试，覆盖不同提示长度、候选顺序、重复 token、两路分数差以及只返回候选分数：
+
+```bash
+python -B -m unittest train.test_vllm_client -v
+```
 
 无需模型和 GPU 的加载路由测试，覆盖原始模型、最终 adapter、中间 checkpoint、tokenizer 回退和 vLLM rank 容量：
 

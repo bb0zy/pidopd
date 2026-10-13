@@ -1,15 +1,29 @@
+import argparse
+import os
 from pathlib import Path
 
-from datasets import Dataset
-from peft import LoraConfig
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-from .myconfig import MyConfig
-from .mytrainer import MyTrainer
-from .utils import prepare_messages
-
-
 if __name__ == "__main__":
+    # Spawned teacher processes must not initialize the student's CUDA libraries.
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
+    from datasets import Dataset
+    from peft import LoraConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from .myconfig import MyConfig
+    from .mytrainer import MyTrainer
+    from .utils import prepare_messages
+
+    parser = argparse.ArgumentParser(description="Train with an offline vLLM teacher.")
+    for name in ("student_model_path", "teacher_model_path"):
+        config_field = MyConfig.__dataclass_fields__[name]
+        parser.add_argument(
+            f"--{name}", f"--{name.replace('_', '-')}",
+            default=config_field.default,
+            help=config_field.metadata["help"],
+        )
+    cli_args = parser.parse_args()
+
     project_root = Path(__file__).resolve().parents[1]
     data_dir = project_root / "dataset" / "train"
 
@@ -40,7 +54,7 @@ Present a self-contained solution without mentioning the reference solution."""
         remove_columns=train_dataset.column_names,
     )
 
-    model_path = "/models/qwen"
+    model_path = cli_args.student_model_path
     model_name = Path(model_path).name
     checkpoint_dir = project_root / "train" / "checkpoint" / model_name
     final_model_dir = project_root / "train" / "outputs" / model_name
@@ -69,6 +83,9 @@ Present a self-contained solution without mentioning the reference solution."""
 
     args = MyConfig(
         output_dir=str(checkpoint_dir),
+        student_model_path=cli_args.student_model_path,
+        teacher_model_path=cli_args.teacher_model_path,
+        teacher_gpu="1",
         per_device_train_batch_size=2,
         gradient_accumulation_steps=8,
         learning_rate=1e-5,
@@ -92,5 +109,8 @@ Present a self-contained solution without mentioning the reference solution."""
         processing_class=tokenizer,
         peft_config=lora_config,
     )
-    trainer.train()
-    trainer.save_model(str(final_model_dir))
+    try:
+        trainer.train()
+        trainer.save_model(str(final_model_dir))
+    finally:
+        trainer.teacher_client.close()

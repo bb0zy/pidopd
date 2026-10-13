@@ -91,11 +91,20 @@ class MyTrainer(SFTTrainer):
         # The loss uses a per-micro-batch token mean; let Trainer scale gradient accumulation.
         self.model_accepts_loss_kwargs = False
 
-        # teacher_model is the served API model name, not a local model path.
+        # The frozen teacher runs offline in a separate process on its own GPU.
         self.teacher_client = VLLMClient(
-            base_url=args.teacher_vllm_base_url,
-            model=teacher_model or args.teacher_vllm_model,
-            api_key=args.teacher_vllm_api_key,
+            model=teacher_model or args.teacher_model_path,
+            gpu=args.teacher_gpu,
+            dtype="auto",
+            tensor_parallel_size=1,
+            max_model_len=args.teacher_max_model_len,
+            max_num_seqs=args.teacher_max_num_seqs,
+            gpu_memory_utilization=args.teacher_gpu_memory_utilization,
+            max_logprobs=-1,
+            generation_config="vllm",
+            skip_tokenizer_init=True,
+            enable_prefix_caching=False,
+            disable_log_stats=True,
         )
 
         # Disable dropout in the model
@@ -142,9 +151,6 @@ class MyTrainer(SFTTrainer):
             teacher_inputs.append(prompt_ids + completion_ids)
             teacher_prompt_lengths.append(len(prompt_ids))
 
-        normal_teacher_response = self.teacher_client.score(normal_teacher_inputs)
-        teacher_response = self.teacher_client.score(teacher_inputs)
-
         student_outputs = model(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
@@ -155,25 +161,20 @@ class MyTrainer(SFTTrainer):
         answer_mask = inputs["labels"][:, 1:] != -100
         student_logits = student_outputs.logits[:, :-1, :][answer_mask].float()
         topk_logits, topk_indices = student_logits.topk(self.args.loss_top_k, dim=-1)
-        topk_indices_cpu = topk_indices.detach().cpu()
+        answer_lengths = answer_mask.sum(dim=1).tolist()
+        candidate_ids = [
+            indices.tolist()
+            for indices in topk_indices.detach().cpu().split(answer_lengths)
+        ]
+        normal_teacher_response = self.teacher_client.score(
+            normal_teacher_inputs, normal_teacher_prompt_lengths, candidate_ids,
+        )
+        teacher_response = self.teacher_client.score(
+            teacher_inputs, teacher_prompt_lengths, candidate_ids,
+        )
 
-        # score() omits the first input token, so answer scores start at prompt_length - 1.
-        # Select matching student candidates on CPU before transferring rewards to the GPU.
-        teacher_topk_diffs = []
-        offset = 0
-        for i, prompt_length in enumerate(teacher_prompt_lengths):
-            teacher_log_probs = teacher_response[i][prompt_length - 1:]
-            normal_prompt_length = normal_teacher_prompt_lengths[i]
-            normal_teacher_log_probs = normal_teacher_response[i][normal_prompt_length - 1:]
-            answer_length = teacher_log_probs.size(0)
-            indices = topk_indices_cpu[offset : offset + answer_length]
-            teacher_topk = teacher_log_probs.gather(dim=-1, index=indices)
-            normal_teacher_topk = normal_teacher_log_probs.gather(dim=-1, index=indices)
-            teacher_topk_diffs.append(teacher_topk - normal_teacher_topk)
-            offset += answer_length
-
-        # Only the selected log probability gains, shaped (answer_tokens, K), move to the GPU.
-        r_1 = torch.cat(teacher_topk_diffs, dim=0).detach().to(student_logits.device)
+        # score() already selects [answer_tokens, K] on the teacher side.
+        r_1 = (teacher_response - normal_teacher_response).to(student_logits.device)
         topk_weights = F.softmax(topk_logits.detach(), dim=-1)
         r2 = topk_weights * r_1
 

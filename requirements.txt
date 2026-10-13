@@ -5,7 +5,7 @@ transformers==5.3.0
 trl==1.13.0
 peft==0.19.0
 datasets
-openai
+numpy
 wandb
 pyarrow>=18.0.0
 packaging>=24.0
