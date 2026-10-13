@@ -33,7 +33,7 @@ class MyConfig(SFTConfig):
     )
     teacher_max_model_len: int = field(default=8192)
     teacher_score_chunk_size: int = field(
-        default=256,
+        default=8192,
         metadata={"help": "Tokens per cached teacher forward; limits full-vocabulary logits memory."},
     )
     disable_dropout: bool = field(
