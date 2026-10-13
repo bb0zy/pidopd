@@ -7,5 +7,6 @@ wandb/
 train/outputs/
 train/checkpoint/
 .DS_Store
-dataset/train/
+dataset/train/train-00000-of-00002.parquet
+dataset/train/train-00001-of-00002.parquet
 dataset/eval/
