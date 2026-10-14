@@ -19,6 +19,14 @@ class MyConfig(SFTConfig):
         default=16,
         metadata={"help": "Number of student vocabulary candidates used per answer token in the loss."},
     )
+    kl_beta: float = field(
+        default=1.0,
+        metadata={"help": "Strength of the KL constraint toward the frozen initial student model."},
+    )
+    kl_top_k: int = field(
+        default=64,
+        metadata={"help": "Candidate tokens retained individually in the coarse-grained KL; other tokens form one bucket."},
+    )
     student_model_path: str = field(
         default="/models/qwen3-1.7b",
         metadata={"help": "Local model directory for the student and its tokenizer."},

@@ -20,7 +20,6 @@ from transformers.trainer_utils import EvalPrediction
 from transformers.utils import is_peft_available
 
 from trl import SFTTrainer
-from trl.experimental.utils import empty_cache
 from trl.trainer.utils import disable_dropout_in_model
 
 from .myconfig import MyConfig
@@ -34,6 +33,17 @@ if is_peft_available():
 
 
 logger = get_logger(__name__)
+
+
+def coarse_kl_loss(student_log_probs, reference_log_probs):
+    """KL over selected tokens plus one bucket for the remaining vocabulary."""
+    student_probs = student_log_probs.exp()
+    reference_probs = reference_log_probs.exp()
+    student_other = (1 - student_probs.sum(dim=-1)).clamp_min(1e-8)
+    reference_other = (1 - reference_probs.sum(dim=-1)).clamp_min(1e-8)
+    selected_kl = (student_probs * (student_log_probs - reference_log_probs)).sum(dim=-1)
+    other_kl = student_other * (student_other.log() - reference_other.log())
+    return (selected_kl + other_kl).mean()
 
 
 class MyTrainer(SFTTrainer):
@@ -91,6 +101,7 @@ class MyTrainer(SFTTrainer):
         # Teacher scoring and the student vLLM server share the inference GPU.
         self.teacher_client = TeacherClient(
             model_path=teacher_model or args.teacher_model_path,
+            reference_model_path=args.student_model_path if args.kl_beta > 0 else None,
             gpu=args.teacher_gpu,
             max_length=args.teacher_max_model_len,
             chunk_size=args.teacher_score_chunk_size,
@@ -148,7 +159,6 @@ class MyTrainer(SFTTrainer):
         teacher_response = self.teacher_client.score(
             teacher_inputs, teacher_prompt_lengths, candidate_ids,
         )
-
         # score() already selects [answer_tokens, K] on the teacher side.
         r_1 = (teacher_response - normal_teacher_response).to(student_logits.device)
         topk_weights = F.softmax(topk_logits.detach(), dim=-1)
@@ -157,10 +167,21 @@ class MyTrainer(SFTTrainer):
         # Normalize over the full vocabulary and keep gradients only through student log probabilities.
         student_log_probs = F.log_softmax(student_logits, dim=-1)
         topk_log_probs = student_log_probs.gather(dim=-1, index=topk_indices)
-        loss = -(r2 * topk_log_probs).sum(dim=-1).mean()
-
-        # empty cache
-        # empty_cache()
+        teacher_loss = -(r2 * topk_log_probs).sum(dim=-1).mean()
+        loss = teacher_loss
+        if self.args.kl_beta > 0:
+            kl_indices = student_logits.topk(self.args.kl_top_k, dim=-1).indices
+            reference_candidate_ids = [
+                indices.tolist() for indices in kl_indices.detach().cpu().split(answer_lengths)
+            ]
+            reference_log_probs = self.teacher_client.score_reference(
+                normal_teacher_inputs, normal_teacher_prompt_lengths, reference_candidate_ids,
+            ).to(student_logits.device)
+            kl_student_log_probs = student_log_probs.gather(dim=-1, index=kl_indices)
+            kl_loss = coarse_kl_loss(kl_student_log_probs, reference_log_probs)
+            loss = teacher_loss + self.args.kl_beta * kl_loss
+            if self.state.global_step % self.args.logging_steps == 0:
+                self.log({"teacher_loss": teacher_loss.detach().item(), "kl_to_base": kl_loss.detach().item()})
 
         # Return loss
         return (loss, student_outputs) if return_outputs else loss

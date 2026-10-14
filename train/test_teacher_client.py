@@ -91,7 +91,7 @@ class TeacherTests(unittest.TestCase):
         model.to.return_value = model
         model.eval.return_value = model
         loader = SimpleNamespace(from_pretrained=Mock(return_value=model))
-        request = ([[1, 2, 3]], [2], [[[4, 0]]])
+        request = ("teacher", [[1, 2, 3]], [2], [[[4, 0]]])
         connection = Mock()
         connection.recv.side_effect = [request, request, None]
         small_scores = array_tensor([[-1, -2]], dtype=np.float32)
@@ -100,7 +100,7 @@ class TeacherTests(unittest.TestCase):
             patch.dict(os.environ),
             patch("train.teacher_client.score_candidates", return_value=small_scores) as scorer,
         ):
-            _run_teacher(connection, "1", "/models/teacher", 8192, 256)
+            _run_teacher(connection, "1", "/models/teacher", None, 8192, 256)
             self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "1")
         loader.from_pretrained.assert_called_once_with("/models/teacher", local_files_only=True, dtype="auto")
         model.to.assert_called_once_with("cuda")
@@ -113,7 +113,7 @@ class TeacherTests(unittest.TestCase):
         loader = SimpleNamespace(from_pretrained=Mock(side_effect=ValueError("bad model")))
         connection = Mock()
         with patch.dict("sys.modules", {"transformers": SimpleNamespace(AutoModelForCausalLM=loader)}), patch.dict(os.environ):
-            _run_teacher(connection, "1", "/missing", 8192, 256)
+            _run_teacher(connection, "1", "/missing", None, 8192, 256)
         success, error = connection.send.call_args.args[0]
         self.assertFalse(success)
         self.assertIn("bad model", error)
@@ -126,6 +126,38 @@ class TeacherTests(unittest.TestCase):
             scores = client.score([[1, 2]], [1], [[[0, 3]]])
         self.assertEqual(scores.shape, (1, 2))
         self.assertEqual(scores.dtype, np.float32)
+
+    def test_frozen_base_routes_separately_from_teacher(self):
+        teacher = Mock()
+        reference = Mock()
+        for model in (teacher, reference):
+            model.to.return_value = model
+            model.eval.return_value = model
+        loader = SimpleNamespace(from_pretrained=Mock(side_effect=[teacher, reference]))
+        inputs = ([[1, 2, 3]], [2], [[[4, 0]]])
+        connection = Mock()
+        connection.recv.side_effect = [("teacher", *inputs), ("reference", *inputs), None]
+        with (
+            patch.dict("sys.modules", {"transformers": SimpleNamespace(AutoModelForCausalLM=loader)}),
+            patch.dict(os.environ),
+            patch("train.teacher_client.score_candidates", return_value=array_tensor([[-1, -2]], dtype=np.float32)) as scorer,
+        ):
+            _run_teacher(connection, "1", "/models/teacher", "/models/student", 8192, 256)
+        self.assertEqual(
+            [call.args[0] for call in loader.from_pretrained.call_args_list],
+            ["/models/teacher", "/models/student"],
+        )
+        teacher.requires_grad_.assert_called_once_with(False)
+        reference.requires_grad_.assert_called_once_with(False)
+        self.assertIs(scorer.call_args_list[0].args[0], teacher)
+        self.assertIs(scorer.call_args_list[1].args[0], reference)
+
+        client = TeacherClient.__new__(TeacherClient)
+        client.connection = Mock()
+        client.connection.recv.return_value = (True, np.array([[-1, -2]], dtype=np.float32))
+        with patch.dict("sys.modules", {"torch": ARRAY_TORCH}):
+            client.score_reference(*inputs)
+        self.assertEqual(client.connection.send.call_args.args[0][0], "reference")
 
 
 @unittest.skipUnless(

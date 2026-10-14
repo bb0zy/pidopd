@@ -44,7 +44,7 @@ def score_candidates(model, token_ids, prompt_lengths, candidate_ids, max_length
     return torch.cat(scores, dim=0)
 
 
-def _run_teacher(connection, gpu, model_path, max_length, chunk_size):
+def _run_teacher(connection, gpu, model_path, reference_model_path, max_length, chunk_size):
     # Set visibility before importing CUDA libraries in this fresh spawn process.
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu
     try:
@@ -54,14 +54,21 @@ def _run_teacher(connection, gpu, model_path, max_length, chunk_size):
             model_path, local_files_only=True, dtype="auto",
         ).to("cuda").eval()
         model.requires_grad_(False)
+        reference_model = None
+        if reference_model_path is not None:
+            reference_model = AutoModelForCausalLM.from_pretrained(
+                reference_model_path, local_files_only=True, dtype="auto",
+            ).to("cuda").eval()
+            reference_model.requires_grad_(False)
         connection.send((True, None))
         while True:
             request = connection.recv()
             if request is None:
                 break
-            token_ids, prompt_lengths, candidate_ids = request
+            model_kind, token_ids, prompt_lengths, candidate_ids = request
             scores = score_candidates(
-                model, token_ids, prompt_lengths, candidate_ids, max_length, chunk_size,
+                reference_model if model_kind == "reference" else model,
+                token_ids, prompt_lengths, candidate_ids, max_length, chunk_size,
             )
             # Send only [total_answer_tokens, K] as a compact CPU array, never full logits.
             connection.send((True, scores.numpy()))
@@ -74,12 +81,12 @@ def _run_teacher(connection, gpu, model_path, max_length, chunk_size):
 
 
 class TeacherClient:
-    def __init__(self, model_path, gpu="1", max_length=8192, chunk_size=256):
+    def __init__(self, model_path, reference_model_path=None, gpu="1", max_length=8192, chunk_size=256):
         context = mp.get_context("spawn")
         self.connection, child_connection = context.Pipe()
         self.process = context.Process(
             target=_run_teacher,
-            args=(child_connection, gpu, model_path, max_length, chunk_size),
+            args=(child_connection, gpu, model_path, reference_model_path, max_length, chunk_size),
             name="transformers-teacher",
         )
         self.process.start()
@@ -93,12 +100,18 @@ class TeacherClient:
             raise RuntimeError(f"Transformers teacher failed:\n{result}")
         return result
 
-    def score(self, token_ids, prompt_lengths, candidate_ids):
+    def _score(self, model_kind, token_ids, prompt_lengths, candidate_ids):
         """Return detached CPU float32 scores in batch, answer-position, candidate order."""
         import torch
 
-        self.connection.send((token_ids, prompt_lengths, candidate_ids))
+        self.connection.send((model_kind, token_ids, prompt_lengths, candidate_ids))
         return torch.from_numpy(self._receive())
+
+    def score(self, token_ids, prompt_lengths, candidate_ids):
+        return self._score("teacher", token_ids, prompt_lengths, candidate_ids)
+
+    def score_reference(self, token_ids, prompt_lengths, candidate_ids):
+        return self._score("reference", token_ids, prompt_lengths, candidate_ids)
 
     def close(self):
         if self.connection.closed:

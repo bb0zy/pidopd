@@ -12,6 +12,7 @@ train/
   main.py                    # 数据加载、模型和 LoRA 配置、启动训练
   myconfig.py                # Trainer 扩展配置
   mytrainer.py               # 学生生成、自定义 loss、训练步骤
+  test_loss_regularization.py # KL 数值测试
   student_generation.py      # 跨卡 vLLM 生成、实时权重同步、回答 padding
   test_student_generation.py # 权重同步顺序与回答对齐测试
   utils.py                   # 消息准备、tokenization、padding
@@ -79,6 +80,8 @@ collator 使用同一个 tokenizer 构造两路提示并左侧 padding。`max_le
 | `num_train_epochs` | 1 | 遍历数据的轮数 |
 | `max_new_tokens` | 2048 | 每次学生回答的生成上限 |
 | `loss_top_k` | 16 | 每个有效回答位置参与 loss 的候选数 |
+| `kl_beta` | 1.0 | 相对初始学生基座的 KL 约束系数，设0可关闭 |
+| `kl_top_k` | 64 | KL 单独保留的学生候选数，其余词合并为一类 |
 | `save_steps` | 50 | 每50个优化器更新步保存 checkpoint |
 | `logging_steps` | 10 | 日志间隔 |
 | `eval_strategy` | `no` | 训练内评估关闭，使用独立评测入口 |
@@ -110,13 +113,13 @@ CUDA_VISIBLE_DEVICES=0 python -m train.main \
 
 每次生成前都调用 `sync_weights()`：把当前学生的 LoRA 临时合并，经 NCCL 从 GPU0 同步完整权重到 GPU1，再恢复学生的未合并训练状态，并清空旧前缀缓存。首次生成、每次优化器更新之后的下一次生成以及恢复训练后的首次生成都经过这一同步。不会从磁盘重新加载旧 adapter；同步完成后才提交生成请求。vLLM 关闭睡眠，权重和 KV cache 内存池常驻 GPU1，避免每轮释放、重新分配。跨卡链路是否有 NVLink 会影响同步成本。
 
-`GPU_MEMORY_UTILIZATION=0.5` 在启动脚本中调整，也可通过同名环境变量覆盖。它是 vLLM 的显存预算，不是 GPU 计算利用率目标；A100 80G 上约为一半总显存，其余留给同卡教师的权重、评分 logits 和中间张量。当前顺序是 GPU1 生成 → GPU0 学生前向并选 top-K → GPU1 教师评分 → GPU0 反向传播与参数更新；没有跨 batch 流水线。当前仍让32条一起计算 loss，没有分组或隐藏的梯度累积；GPU0 不再放置 vLLM，但长回答下的全词表 logits 和计算图仍可能超过80G。
+`GPU_MEMORY_UTILIZATION=0.5` 在启动脚本中调整，也可通过同名环境变量覆盖。它是 vLLM 的显存预算，不是 GPU 计算利用率目标；A100 80G 上约为一半总显存，其余留给同卡教师评分和冻结的初始学生基座模型。当前顺序是 GPU1 生成 → GPU0 学生前向并选 top-K → GPU1 教师与基座评分 → GPU0 反向传播与参数更新；没有跨 batch 流水线。当前仍让32条一起计算 loss，没有分组或隐藏的梯度累积；GPU0 不再放置 vLLM，但长回答下的全词表 logits 和计算图仍可能超过80G。
 
 `/reset_prefix_cache` 在部分 vLLM 版本中成功后返回空响应。项目只对当前客户端的这个接口做兼容：发送真实清缓存请求并检查 HTTP 状态，不强制解析 JSON；生成与权重传输接口仍沿用 TRL 的原有处理，不修改已安装包。更换启动方式本身不能修复这个响应格式问题。
 
 教师当前 `teacher_max_model_len=8192`、`teacher_score_chunk_size=8192`，在上下文预算内相当于整段评分。按学生最多生成2048个 token 计算，教师提示（含参考解答）可使用最多6144个 token；教师只评分，不额外生成 token。超过总长度预算时会报错，不自动截断。教师模型也需要支持该长度。
 
-教师仍逐条处理 batch 中的输入。`teacher_score_chunk_size` 可调小以限制单次前向的 logits 显存，用 KV cache 保留前文；它不改变上下文长度、候选数或 loss。教师没有固定显存比例或预分配 KV cache 配额，显存由模型权重、实际长度的 KV cache 和当前分块 logits 决定。
+教师仍逐条处理 batch 中的输入。同一进程额外加载一个冻结的初始学生基座，用于 KL 参照；默认1.7B BF16 权重约占3.4 GB GPU1显存。`teacher_score_chunk_size` 可调小以限制单次前向的 logits 显存，用 KV cache 保留前文；它不改变上下文长度、候选数或 loss。推理进程没有固定显存比例或预分配 KV cache 配额，显存由两份模型权重、实际长度的 KV cache 和当前分块 logits 决定。
 
 ### 训练目标与资源开销
 
@@ -125,13 +128,19 @@ CUDA_VISIBLE_DEVICES=0 python -m train.main \
 ```text
 indices = topk(student_logits, K).indices
 r_1 = teacher_logprob[indices] - normal_teacher_logprob[indices]
-r2 = softmax(student_topk_logits.detach()) * r_1
-loss = mean_over_answer_tokens(-sum_over_K(r2 * student_topk_logprob))
+weights = softmax(student_topk_logits.detach())
+r2 = weights * r_1
+teacher_loss = mean_over_answer_tokens(-sum_over_K(r2 * student_topk_logprob))
+loss = teacher_loss + kl_beta * kl_to_base
 ```
 
-`student_topk_logprob` 来自全词表 `log_softmax`，保留梯度；teacher 差值和权重不保留梯度。教师在 GPU1 上用 `selected_logits - logsumexp(full_vocab_logits)` 得到候选 logprob，全词表归一化保持不变。只把 `[有效回答 token 数, K]` 的 float32 数组通过本地 Pipe 返回，训练进程相减后将 `r_1` 搬到 GPU0。这是实验性目标，loss 可以为负。
+`student_topk_logprob` 来自全词表 `log_softmax`，保留梯度；teacher 差值和权重不保留梯度。教师差值按原目标直接与学生 top-K 权重相乘，不做去均值处理。教师在 GPU1 上用 `selected_logits - logsumexp(full_vocab_logits)` 得到候选 logprob，全词表归一化保持不变。只把 `[有效回答 token 数, K]` 的 float32 数组通过本地 Pipe 返回。这是实验性目标，`teacher_loss` 可以为负。
 
-学生 vLLM 生成不保留梯度，生成后根据返回长度补齐回答、构造 mask 和 labels；真实 EOS 参与 loss，回答 padding 和 prompt 不参与。计算 loss 的 Transformers 学生前向显式关闭 KV cache，继续由 Trainer 执行反向传播与优化器更新。teacher 使用固定的基座权重，不随学生更新参数。教师评分期间，学生前向的计算图仍保留在 GPU0 上。
+`kl_to_base` 使用同一回答上下文，比较当前学生与冻结的初始学生基座。为控制显存和跨进程传输，对学生概率最高的64个词分别计算概率，其余词合并为一个剩余概率桶，然后计算这个分组分布的 KL；这是全词表 KL 的下界，不能捕捉剩余桶内部的变化。基座在 GPU1 的教师子进程中评分，只返回 `[有效回答 token 数, 64]` 的 logprob；学生端仍以全词表归一化，不会把全词表从 GPU1 搬到 GPU0。这个约束增加第三路评分和基座模型显存，不保证单靠它就能恢复准确率。默认 `kl_beta=1.0` 是重新试跑的起点；日志记录 `teacher_loss` 与 `kl_to_base`，应结合评测结果调整系数。设 `kl_beta=0` 时不加载冻结基座，也不执行第三路评分。
+
+训练命令可用 `--kl_beta 0.5` 或 `--kl_top_k 128` 覆盖默认值；`--kl_beta 0` 可关闭 KL 基座评分用于对照。改变 `kl_top_k` 只影响评分候选数，不改变学生生成并发和 teacher 目标的 `loss_top_k`。
+
+学生 vLLM 生成不保留梯度，生成后根据返回长度补齐回答、构造 mask 和 labels；真实 EOS 参与 loss，回答 padding 和 prompt 不参与。计算 loss 的 Transformers 学生前向显式关闭 KV cache，继续由 Trainer 执行反向传播与优化器更新。teacher 与 KL 基座模型均保持冻结，不随学生更新参数。GPU1 评分期间，学生前向的计算图仍保留在 GPU0 上。
 
 教师使用 `eval()`、冻结参数和 `torch.inference_mode()`，直接进行分块前向，不调用 `generate()`。每块 logits 在 GPU 上提取候选后释放，避免构造完整序列的全词表分数张量，也不把全词表搬到 CPU 或展开成 Python 对象。分块前向与整段前向可能有浮点数值差异，实际 GPU 速度仍需上机验证。没有新增计时代码。
 
@@ -237,6 +246,12 @@ python -B -m unittest train.test_student_generation -v
 
 ```bash
 python -B -m unittest train.test_teacher_client -v
+```
+
+KL 测试在已安装训练依赖的环境使用 CPU 张量，检查剩余词概率桶的 KL 数值以及反向梯度：
+
+```bash
+python -B -m unittest train.test_loss_regularization -v
 ```
 
 无需模型和 GPU 的加载路由测试，覆盖原始模型、最终 adapter、中间 checkpoint、tokenizer 回退和 vLLM rank 容量：
