@@ -171,8 +171,10 @@ CUDA_VISIBLE_DEVICES=0 python eval/run_eval.py \
   --backend transformers
 
 # vLLM tensor parallelism
-CUDA_VISIBLE_DEVICES=0,1 python eval/run_eval.py \
-  --model /models/qwen --tensor-parallel-size 2
+python eval/run_eval.py \
+  --model /models/qwen3-1.7b --tensor-parallel-size 1 \
+  --lora-path train/checkpoint/qwen3-1.7b/checkpoint-50
+
 ```
 
 `--model` 始终指向完整的本地基座模型，必须与 adapter 训练时的权重一致；`--lora-path` 指向最终目录或任意 checkpoint。不传 `--lora-path` 时评测原始模型。vLLM 使用 `LoRARequest`，Transformers 使用 PEFT，无需提前合并模型。优先使用 adapter 目录保存的 tokenizer，没有 `tokenizer_config.json` 时使用基座 tokenizer。这一路径面向当前未扩充词表的普通 LoRA 配置。
