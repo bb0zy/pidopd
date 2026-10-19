@@ -29,6 +29,19 @@
       "length_finish_rate": 0.1,
       "answer_extraction_failure_rate": 0.1
     },
+    "aime26.jsonl": {
+      "questions": 30,
+      "completions": 480,
+      "avg@32": 0.6479166666666667,
+      "generation_seconds": 6052.422564788256,
+      "output_tokens": 7453186,
+      "output_tokens_per_second": 1231.4384728127043,
+      "completions_per_second": 0.0793070865197914,
+      "mean_batch_seconds": 403.4948376525504,
+      "median_batch_seconds": 300.69683754700236,
+      "length_finish_rate": 0.03333333333333333,
+      "answer_extraction_failure_rate": 0.03333333333333333
+    },
     "hmmt_feb.parquet": {
       "questions": 30,
       "completions": 480,
