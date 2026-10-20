@@ -1,9 +1,56 @@
 """CPU checks: python -B -m unittest train.test_grpo_train -v."""
 
+import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
 from train import grpo_train
+
+
+class GrpoLaunchCheckpointTests(unittest.TestCase):
+    def test_plain_python_uses_one_gpu_without_distributed_environment(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(grpo_train.configure_launch(), (1, 0))
+            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "0")
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "3,5"}, clear=True):
+            self.assertEqual(grpo_train.configure_launch(), (1, 0))
+            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "3")
+
+    def test_torchrun_supports_arbitrary_gpu_counts_and_keeps_device_mapping(self):
+        for world_size in (1, 2, 4):
+            for rank in range(world_size):
+                visible = ",".join(str(i + 2) for i in range(world_size))
+                with self.subTest(world_size=world_size, rank=rank), patch.dict(
+                    os.environ, {"WORLD_SIZE": str(world_size), "LOCAL_RANK": str(rank),
+                                 "CUDA_VISIBLE_DEVICES": visible}, clear=True
+                ):
+                    self.assertEqual(grpo_train.configure_launch(), (world_size, rank))
+                    self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], visible)
+                    cli = grpo_train.parse_args([])
+                    batch = cli.per_device_train_batch_size * world_size * cli.gradient_accumulation_steps
+                    self.assertEqual(batch % cli.num_generations, 0)
+
+    def test_incomplete_distributed_environment_fails(self):
+        with patch.dict(os.environ, {"WORLD_SIZE": "2"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "torchrun"):
+                grpo_train.configure_launch()
+
+    def test_full_model_and_sharded_checkpoints_are_resumable(self):
+        for name in ("model.safetensors", "model.safetensors.index.json"):
+            with self.subTest(weights=name), TemporaryDirectory() as directory:
+                checkpoint = Path(directory)
+                (checkpoint / "trainer_state.json").write_text("{}", encoding="utf-8")
+                (checkpoint / name).write_text("", encoding="utf-8")
+                grpo_train.validate_full_checkpoint(checkpoint)
+
+    def test_incomplete_checkpoints_are_rejected(self):
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory)
+            (checkpoint / "trainer_state.json").write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "full-model"):
+                grpo_train.validate_full_checkpoint(checkpoint)
 
 
 class GrpoDataRewardTests(unittest.TestCase):

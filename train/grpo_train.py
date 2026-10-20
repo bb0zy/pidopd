@@ -1,23 +1,24 @@
-r"""Qwen3-1.7B LoRA GRPO on two A100 80GB GPUs (Linux/CUDA).
+r"""Qwen3-1.7B full-parameter GRPO on one or more GPUs (Linux/CUDA).
 
 From the project root, using the environment in requirements.txt and its custom
 vLLM 0.19.1 build (do not start vllm/start_vllm.sh for this script):
+
+    CUDA_VISIBLE_DEVICES=0 python -m train.grpo_train
 
     CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
         -m train.grpo_train
 
 Resume with the same command plus --resume-from-checkpoint latest.
-Checkpoints: train/grpo_checkpoint/checkpoint-{50,100,...}/; final adapter: final/.
-Checkpoints contain LoRA/tokenizer AND optimizer/scheduler/RNG state for resume;
-they do not contain a second copy of the frozen base-model weights.
+Checkpoints: train/grpo_checkpoint/checkpoint-{50,100,...}/; final model: final/.
+Checkpoints contain full model/tokenizer AND optimizer/scheduler/RNG state.
 
 Configuration basis:
 https://arxiv.org/html/2402.03300v3#S4.SS2
 https://huggingface.co/docs/trl/v1.13.0/en/grpo_trainer
 DeepSeekMath uses lr=1e-6, beta=0.04, G=64, batch=1024 and one update per rollout.
-Here G=8 and batch=128 are scaled to two GPUs; lr=5e-6 is a LoRA starting point.
-1000 optimizer steps x (128/8) prompts = 16000 prompt draws (~0.92 dataset pass
-before length filtering). This is a budget-based starting point, not a paper's
+Here G=8 and lr=1e-6. The effective batch is 64 completions per GPU (128 with
+two GPUs). At 1000 optimizer steps this is 8000 prompt draws per GPU (~0.92
+dataset pass with two GPUs before filtering). This is a starting point, not a paper's
 universal step count. The default loss is explicitly classic GRPO; --loss-type
 dapo selects TRL's token-normalized variant without changing the dataset.
 """
@@ -112,25 +113,24 @@ def parse_args(argv=None):
     parser.add_argument("--per-device-train-batch-size", type=int, default=2)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
     parser.add_argument("--num-generations", type=int, default=8)
-    parser.add_argument("--learning-rate", type=float, default=5e-6)
+    parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--beta", type=float, default=0.04)
     parser.add_argument("--max-prompt-length", type=int, default=1024, help="Filter longer prompts; never truncate questions")
     parser.add_argument("--max-completion-length", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--lora-rank", type=int, default=32)
-    parser.add_argument("--lora-alpha", type=int, default=64)
     parser.add_argument("--loss-type", choices=("grpo", "dapo", "dr_grpo"), default="grpo")
     parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=False,
                         help="Default off to fit a 4096-token budget; step-by-step solving is still requested")
-    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.35)
-    parser.add_argument("--vllm-enable-sleep-mode", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.25)
+    parser.add_argument("--vllm-enable-sleep-mode", action=argparse.BooleanOptionalAction, default=True,
+                        help="Release vLLM weights/cache during full-parameter optimization")
     parser.add_argument("--resume-from-checkpoint", nargs="?", const="latest", default=None,
                         help="Checkpoint path, or latest in output-dir")
     parser.add_argument("--report-to", choices=("none", "wandb", "tensorboard"), default="none")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args(argv)
     for name in ("max_steps", "per_device_train_batch_size", "gradient_accumulation_steps",
-                 "num_generations", "max_prompt_length", "max_completion_length", "lora_rank", "lora_alpha"):
+                 "num_generations", "max_prompt_length", "max_completion_length"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.num_generations < 2:
@@ -142,23 +142,55 @@ def parse_args(argv=None):
     return args
 
 
+def configure_launch():
+    """Select one GPU for plain Python; respect torchrun's per-process local rank.
+
+    Call before importing Torch so a non-distributed launch cannot accidentally
+    activate Transformers DataParallel over every visible GPU.
+    """
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size < 1 or local_rank < 0:
+        raise ValueError("WORLD_SIZE must be positive and LOCAL_RANK must be nonnegative")
+    if world_size > 1 and "LOCAL_RANK" not in os.environ:
+        raise RuntimeError("Multi-GPU training requires torchrun --nproc_per_node=<GPU count>")
+    if world_size == 1:
+        if local_rank != 0:
+            raise ValueError("A single-process launch must use LOCAL_RANK=0")
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+        os.environ["CUDA_VISIBLE_DEVICES"] = visible.split(",")[0].strip()
+    return world_size, local_rank
+
+
+def validate_full_checkpoint(checkpoint):
+    """Check training state and model weights before allocating GPU memory."""
+    checkpoint = Path(checkpoint)
+    weights = ("model.safetensors", "model.safetensors.index.json",
+               "pytorch_model.bin", "pytorch_model.bin.index.json")
+    if not (checkpoint / "trainer_state.json").is_file() or not any(
+        (checkpoint / name).is_file() for name in weights
+    ):
+        raise ValueError("Resume requires a full-model training checkpoint with weights and trainer_state.json")
+
+
 def main():
     cli = parse_args()
+    world_size, local_rank = configure_launch()
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
     import torch
     from datasets import Dataset
-    from peft import LoraConfig
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from transformers.trainer_utils import get_last_checkpoint
     from trl import GRPOConfig, GRPOTrainer
 
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size != 2 or not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-        raise RuntimeError("Use CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m train.grpo_train")
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    if not torch.cuda.is_available():
+        raise RuntimeError("GRPO with vLLM requires an NVIDIA CUDA GPU")
+    if local_rank >= torch.cuda.device_count():
+        raise RuntimeError(f"LOCAL_RANK={local_rank} has no visible CUDA device; check CUDA_VISIBLE_DEVICES and torchrun")
+    torch.cuda.set_device(local_rank)
     effective_batch = cli.per_device_train_batch_size * world_size * cli.gradient_accumulation_steps
     if effective_batch % cli.num_generations:
         raise ValueError("Effective batch size must be divisible by --num-generations")
@@ -176,10 +208,10 @@ def main():
         resume = last_checkpoint
     elif resume is not None:
         resume = str(Path(resume).expanduser().resolve())
-        if not Path(resume, "trainer_state.json").is_file():
-            raise ValueError("Resume requires a training checkpoint containing trainer_state.json")
     elif last_checkpoint is not None or (output_dir / "final").exists():
         raise FileExistsError("Output already contains a run; use --resume-from-checkpoint latest or a new --output-dir")
+    if resume is not None:
+        validate_full_checkpoint(resume)
 
     tokenizer = AutoTokenizer.from_pretrained(str(model_path), local_files_only=True, padding_side="left")
     if tokenizer.pad_token is None:
@@ -246,11 +278,11 @@ def main():
         remove_unused_columns=False,
         eval_strategy="no",
         report_to=cli.report_to,
-        run_name="qwen3-1.7b-dapo-grpo-lora",
+        run_name="qwen3-1.7b-dapo-grpo-full",
         logging_steps=1,
         logging_first_step=True,
         save_strategy="steps",
-        save_steps=50,
+        save_steps=100,
         save_total_limit=None,
         save_only_model=False,
         seed=cli.seed,
@@ -261,21 +293,21 @@ def main():
         attn_implementation="sdpa",  # No separate flash-attn installation needed.
     )
     model.config.use_cache = False
-    lora_config = LoraConfig(task_type="CAUSAL_LM", r=cli.lora_rank,
-                             lora_alpha=cli.lora_alpha, lora_dropout=0.0,
-                             target_modules="all-linear", bias="none")
+    model.requires_grad_(True)
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
     trainer = GRPOTrainer(model=model, args=args, train_dataset=train_dataset,
-                          reward_funcs=accuracy_reward, processing_class=tokenizer,
-                          peft_config=lora_config)
+                          reward_funcs=accuracy_reward, processing_class=tokenizer)
     if trainer.is_world_process_zero():
         output_dir.mkdir(parents=True, exist_ok=True)
-        metadata = {**vars(cli), "world_size": world_size,
+        metadata = {**vars(cli), "world_size": world_size, "finetuning_type": "full",
+                    "trainable_parameters": total_parameters,
                     "raw_questions": len(raw_dataset), "usable_questions": len(train_dataset),
                     "completions_per_update": effective_batch,
                     "questions_per_update": effective_batch // cli.num_generations}
         (output_dir / "grpo_run_config.json").write_text(
             json.dumps(metadata, indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
-        print(f"Questions: {len(train_dataset)}/{len(raw_dataset)}; {effective_batch} completions/update; "
+        print(f"Full-parameter training: {total_parameters:,} parameters on {world_size} GPU(s); "
+              f"questions: {len(train_dataset)}/{len(raw_dataset)}; {effective_batch} completions/update; "
               f"{effective_batch // cli.num_generations} questions/update; {cli.max_steps} optimizer steps", flush=True)
     result = trainer.train(resume_from_checkpoint=resume)
     trainer.save_model(str(output_dir / "final"))
