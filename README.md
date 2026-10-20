@@ -267,3 +267,60 @@ python -B -m unittest discover -s eval -p test_answer_grader.py -v
 ```
 
 加载路由测试使用模拟后端，不能替代实际 GPU 推理。训练内评估链路仍未适配，保持 `eval_strategy="no"`，通过独立评测入口比较 checkpoint。
+
+## GRPO LoRA 训练（双卡 A100 80G）
+
+[train/grpo_train.py](train/grpo_train.py) 是独立的 GRPO 入口，默认加载本地
+`/models/qwen3-1.7b`，读取 `dataset/train/dapo-17k.parquet`（17,398 题）。
+使用 `prompt` 构造问题，`reward_model.ground_truth` 仅用于答案奖励；不把标准答案或
+`solution` 放入模型提示。奖励为数学等价判定的 0/1 分，复用项目评测器，只提取
+思考段落之后的最终 `\boxed{...}`，没有最终答案时得 0 分。
+
+在现有 Linux/CUDA 训练环境中，从项目根目录执行：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m train.grpo_train
+```
+
+该入口由两张卡分别运行训练副本及 colocate vLLM（每个引擎 TP=1），无需启动
+`vllm/start_vllm.sh`。沿用 `requirements.txt` 及服务器现有的定制 vLLM 0.19.1，
+不需要安装 FlashAttention。vLLM 每卡显存预算默认为 35%；实际峰值需要在服务器上验证。
+
+| 参数 | 默认值 |
+| --- | --- |
+| 训练步数 | 1,000 个优化器更新步 |
+| LoRA | r=32、alpha=64、all-linear、dropout=0 |
+| 每卡训练 microbatch / 梯度累积 | 2 / 32 |
+| 有效 batch / 每题回答数 | 128 条回答 / 8 |
+| 每个更新步采样的题目数 | 16 |
+| 学习率 / KL beta / clip epsilon | 5e-6 / 0.04 / 0.2 |
+| 学习率调度 | 前 20 步 warmup，之后恒定 |
+| prompt / completion 上限 | 1,024 / 4,096 tokens |
+| 精度及省显存 | BF16、SDPA、gradient checkpointing |
+| 保存频率 | 每 50 个优化器更新步，保留所有 checkpoint |
+
+经典参数参考 [DeepSeekMath §4.2](https://arxiv.org/html/2402.03300v3#S4.SS2)：
+原文采用 lr=1e-6、KL=0.04、每题 64 条回答、batch=1024、每轮采样更新一次。
+这里将采样规模缩小到双卡预算，LoRA 学习率取 5e-6 作为起点。
+论文没有统一规定训练步数；本脚本的 1,000 步对应约 16,000 次题目采样，
+约为原始数据量的 0.92 倍，是本项目的预算配置，仍应通过独立评测选择 checkpoint。
+
+显式指定 `loss_type="grpo"` 和组内奖励标准化；可用 `--loss-type dapo` 选择
+[TRL 1.13 的 token 归一化损失](https://huggingface.co/docs/trl/v1.13.0/en/grpo_trainer)，
+使用 DAPO 数据不等于复现完整 DAPO 算法。超长题目按实际 chat template token 数过滤，
+不截断题目；到达生成长度上限的回答不参与 loss。默认关闭 Qwen3 的 `<think>` 模式，
+仍要求逐步解题；如需开启，可加 `--enable-thinking --max-completion-length 8192`，
+并重新验证显存和回答截断比例。其他参数见 `python -m train.grpo_train --help`。
+
+保存路径为 `train/grpo_checkpoint/checkpoint-50/`、`checkpoint-100/` 等；
+其中保存 LoRA、tokenizer 及恢复训练所需的 optimizer/scheduler/RNG 状态，不复制完整基座。
+训练结束额外保存 `train/grpo_checkpoint/final/`，运行参数记录在 `grpo_run_config.json`。
+断点续训命令如下，或把 `latest` 换为具体的 `checkpoint-<step>` 路径：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  -m train.grpo_train --resume-from-checkpoint latest
+```
+
+CPU 数据/奖励回归检查：`python -B -m unittest train.test_grpo_train -v`。
+未安装 Math-Verify 时跳过实际数学等价检查；其余测试不依赖模型和 GPU。

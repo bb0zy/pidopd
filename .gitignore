@@ -6,6 +6,7 @@ tmp/
 wandb/
 train/outputs/
 train/checkpoint/
+train/grpo_checkpoint/
 .DS_Store
 dataset/train/train-00000-of-00002.parquet
 dataset/train/train-00001-of-00002.parquet
