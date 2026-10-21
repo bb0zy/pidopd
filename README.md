@@ -71,17 +71,22 @@ CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python -m torch.distributed.run \
 ```
 
 每张卡运行完整训练模型及 colocate vLLM（TP=1），无需单独启动 vLLM 服务。
-默认开启 vLLM sleep mode，显存预算为每卡 25%；目标资源为 A100 80G。
+默认开启 vLLM sleep mode，vLLM 引擎显存预算为每卡 50%；目标资源为 A100 80G。
+这不是整个训练进程的显存上限；实际峰值随回答长度变化，需在服务器实测。
 
 | 参数 | 默认值 |
 | --- | --- |
 | 更新步数 / 每题回答数 | 1,000 / 8 |
-| 每卡 microbatch / 梯度累积 | 2 / 32 |
+| 每卡 microbatch / 梯度累积 | 4 / 16 |
 | 有效 batch | 64 × GPU 数条回答 |
 | 学习率 / KL 系数 | 1e-6 / 0.04 |
 | prompt / completion 上限 | 1,024 / 4,096 tokens |
 | 精度 / thinking 模式 | BF16 / 关闭 |
 | checkpoint 保存 | 每 100 步，保留全部 |
+
+默认从 `2 × 32` 调为 `4 × 16`，保持每卡每步64条回答，提高单次训练的并行量。
+以接近70G峰值为调参目标；若仍有余量可试 `--per-device-train-batch-size 8 --gradient-accumulation-steps 8`。
+若训练 OOM，退回 `2 / 32`；若生成或唤醒 vLLM 时 OOM，降低 `--vllm-gpu-memory-utilization`。
 
 超长题目过滤、不截断；生成达到长度上限的回答不参与 loss。
 其他选项见 `python -m train.grpo_train --help`。
@@ -97,7 +102,7 @@ CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python -m torch.distributed.run \
 
 也可将 `latest` 换为具体的 `train/grpo_checkpoint/checkpoint-<step>` 路径。
 可用 `--output-dir` 分开保存不同实验。单卡若要保持双卡默认的有效 batch，
-设置 `--gradient-accumulation-steps 64`。
+设置 `--gradient-accumulation-steps 32`。
 
 ## 教师引导的 LoRA 训练
 

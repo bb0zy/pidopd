@@ -9,7 +9,7 @@ vLLM 0.19.1 build (do not start vllm/start_vllm.sh for this script):
         -m train.grpo_train
 
 Resume with the same command plus --resume-from-checkpoint latest.
-Checkpoints: train/grpo_checkpoint/checkpoint-{50,100,...}/; final model: final/.
+Checkpoints: train/grpo_checkpoint/checkpoint-{100,200,...}/; final model: final/.
 Checkpoints contain full model/tokenizer AND optimizer/scheduler/RNG state.
 
 Configuration basis:
@@ -21,6 +21,11 @@ two GPUs). At 1000 optimizer steps this is 8000 prompt draws per GPU (~0.92
 dataset pass with two GPUs before filtering). This is a starting point, not a paper's
 universal step count. The default loss is explicitly classic GRPO; --loss-type
 dapo selects TRL's token-normalized variant without changing the dataset.
+
+A100 80GB starting point: microbatch=4, accumulation=16, vLLM budget=0.5,
+sleep mode enabled. This uses more training/inference memory while preserving
+64 completions per GPU per optimizer update. Peak memory depends on response
+lengths; this is not a guaranteed 70GB cap or a measured memory prediction.
 """
 
 import argparse
@@ -110,8 +115,10 @@ def parse_args(argv=None):
     parser.add_argument("--data-path", type=Path, default=PROJECT_ROOT / "dataset/train/dapo-17k.parquet")
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "train/grpo_checkpoint")
     parser.add_argument("--max-steps", type=int, default=1000, help="Optimizer updates, not microbatches")
-    parser.add_argument("--per-device-train-batch-size", type=int, default=2)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
+    parser.add_argument("--per-device-train-batch-size", type=int, default=4,
+                        help="Training microbatch per GPU; lower if long responses cause OOM")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=16,
+                        help="4 x 16 preserves 64 completions per GPU per optimizer update")
     parser.add_argument("--num-generations", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--beta", type=float, default=0.04)
@@ -121,7 +128,8 @@ def parse_args(argv=None):
     parser.add_argument("--loss-type", choices=("grpo", "dapo", "dr_grpo"), default="grpo")
     parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=False,
                         help="Default off to fit a 4096-token budget; step-by-step solving is still requested")
-    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.25)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5,
+                        help="vLLM-only GPU budget, not a cap on total GRPO memory")
     parser.add_argument("--vllm-enable-sleep-mode", action=argparse.BooleanOptionalAction, default=True,
                         help="Release vLLM weights/cache during full-parameter optimization")
     parser.add_argument("--resume-from-checkpoint", nargs="?", const="latest", default=None,
