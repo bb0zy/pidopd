@@ -233,6 +233,7 @@ def main():
         # TRL 1.13 has no max_prompt_length; account for the actual chat template.
         ids = tokenizer.apply_chat_template(example["prompt"], tokenize=True,
                                             add_generation_prompt=True, **chat_kwargs)
+        ids = ids if isinstance(ids, list) else ids["input_ids"]
         return len(ids) <= cli.max_prompt_length
 
     train_dataset = train_dataset.filter(within_context, desc="Filter overlong prompts without truncation")

@@ -1,6 +1,8 @@
 r"""Stage 1: generate reusable teacher responses with vLLM (no student loaded).
 
     CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m train.teacher_rollout
+    # Independent teacher replica per GPU (data parallel):
+    CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python -m train.teacher_rollout --data-parallel-size 2
     # Multiple responses per question:
     CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m train.teacher_rollout --num-rollouts 4
 
@@ -15,6 +17,8 @@ import json
 import math
 import os
 from pathlib import Path
+import signal
+import time
 
 from .kd_data import (DEFAULT_ROLLOUT_PATH, PROJECT_ROOT, file_sha256, metadata_path,
                       prepare_example, tokenizer_fingerprint)
@@ -32,6 +36,8 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=32, help="Questions per generation call")
     parser.add_argument("--max-num-seqs", type=int, default=16, help="Concurrent vLLM sequences")
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--data-parallel-size", type=int, default=1,
+                        help="Independent teacher replicas on this node; use Python, not torchrun")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.8)
@@ -42,7 +48,7 @@ def parse_args(argv=None):
     parser.add_argument("--resume", action="store_true")
     cli = parser.parse_args(argv)
     for name in ("num_rollouts", "max_new_tokens", "max_prompt_length", "max_model_len", "batch_size",
-                 "max_num_seqs", "tensor_parallel_size"):
+                 "max_num_seqs", "tensor_parallel_size", "data_parallel_size"):
         if getattr(cli, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if cli.limit is not None and cli.limit < 1:
@@ -56,7 +62,7 @@ def parse_args(argv=None):
     return cli
 
 
-def scan_existing(path, num_rollouts, repair_tail=False):
+def scan_existing(path, num_rollouts, repair_tail=False, exclude_keys=()):
     """Resume complete rows; repair only a torn last JSONL line after a crash."""
     seen, stopped, truncated = set(), 0, 0
     if not path.exists():
@@ -84,9 +90,56 @@ def scan_existing(path, num_rollouts, repair_tail=False):
             if key in seen or key[0] < 0 or not 0 <= key[1] < num_rollouts:
                 raise ValueError(f"Duplicate or invalid cached rollout key: {key}")
             seen.add(key)
-            stopped += int(record["finish_reason"] == "stop")
-            truncated += int(record["finish_reason"] == "length")
+            if key not in exclude_keys:
+                stopped += int(record["finish_reason"] == "stop")
+                truncated += int(record["finish_reason"] == "length")
     return seen, stopped, truncated
+
+
+def scan_cache_files(paths, num_rollouts, repair_tail=False):
+    seen, stopped, truncated = set(), 0, 0
+    for path in paths:
+        keys, finished, limited = scan_existing(path, num_rollouts, repair_tail, exclude_keys=seen)
+        seen.update(keys)
+        stopped += finished
+        truncated += limited
+    return seen, stopped, truncated
+
+
+def merge_cache_files(output_path, paths, expected_responses):
+    """Stream distinct rows into one atomic output; preserve old output on failure."""
+    merged = set()
+    temporary = output_path.with_suffix(".merge.tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as target:
+        for path in paths:
+            if not path.exists():
+                continue
+            with path.open(encoding="utf-8") as source:
+                for line in source:
+                    row = json.loads(line)
+                    key = (row["question_id"], row["sample_id"])
+                    if key not in merged:
+                        target.write(line)
+                        merged.add(key)
+        if len(merged) != expected_responses:
+            raise ValueError(f"Incomplete rollout merge: {len(merged)}/{expected_responses}")
+        target.flush()
+        os.fsync(target.fileno())
+    temporary.replace(output_path)
+
+
+def visible_device_groups(data_parallel_size, tensor_parallel_size):
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        import torch
+        devices = [str(index) for index in range(torch.cuda.device_count())]
+    else:
+        devices = [device.strip() for device in visible.split(",") if device.strip()]
+    required = data_parallel_size * tensor_parallel_size
+    if len(devices) < required or len(set(devices)) != len(devices) or "-1" in devices:
+        raise ValueError(f"DP={data_parallel_size}, TP={tensor_parallel_size} needs {required} distinct visible GPUs")
+    return [",".join(devices[index * tensor_parallel_size:(index + 1) * tensor_parallel_size])
+            for index in range(data_parallel_size)]
 
 
 def output_records(question, output, sample_ids):
@@ -102,16 +155,114 @@ def output_records(question, output, sample_ids):
             for sample_id, completion in zip(sample_ids, sorted(output.outputs, key=lambda item: item.index), strict=True)]
 
 
+def generate_responses(cli, teacher_path, pending, output_path, on_batch=None):
+    from transformers import GenerationConfig
+    from vllm import LLM, SamplingParams
+
+    generation_path = teacher_path / "generation_config.json"
+    eos = (GenerationConfig.from_pretrained(str(teacher_path), local_files_only=True).eos_token_id
+           if generation_path.is_file() else json.loads((teacher_path / "config.json").read_text(encoding="utf-8")).get("eos_token_id"))
+    if eos is None:
+        from transformers import AutoTokenizer
+        eos = AutoTokenizer.from_pretrained(str(teacher_path), local_files_only=True).eos_token_id
+    stop_ids = eos if isinstance(eos, list) else [eos] if eos is not None else []
+    engine = LLM(model=str(teacher_path), tokenizer=str(teacher_path), dtype="bfloat16",
+                 tensor_parallel_size=cli.tensor_parallel_size, gpu_memory_utilization=cli.gpu_memory_utilization,
+                 max_model_len=cli.max_model_len, max_num_seqs=cli.max_num_seqs,
+                 enable_prefix_caching=True, generation_config="vllm", seed=cli.seed)
+    written = 0
+    with output_path.open("a", encoding="utf-8", newline="\n") as handle:
+        for start in range(0, len(pending), cli.batch_size):
+            batch = pending[start:start + cli.batch_size]
+            params = [SamplingParams(n=len(indices), max_tokens=cli.max_new_tokens,
+                                     temperature=cli.temperature, top_p=cli.top_p, top_k=cli.top_k,
+                                     stop_token_ids=stop_ids, seed=cli.seed + question["question_id"])
+                      for question, indices in batch]
+            outputs = engine.generate([{"prompt_token_ids": question["prompt_token_ids"]} for question, _ in batch],
+                                      params, use_tqdm=True)
+            if len(outputs) != len(batch):
+                raise ValueError("vLLM returned an unexpected number of requests")
+            records = []
+            for (question, indices), output in zip(batch, outputs, strict=True):
+                records.extend(output_records(question, output, indices))
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            written += len(records)
+            if on_batch is not None:
+                on_batch(records)
+            print(f"{output_path.name}: saved {written} new responses", flush=True)
+
+
+def rollout_worker(cli, teacher_path, pending, output_path, visible_devices):
+    # Spawned interpreter: isolate the GPU(s) before importing Torch/vLLM.
+    if os.name == "posix":
+        os.setsid()
+    os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+    generate_responses(cli, teacher_path, pending, output_path)
+
+
+def run_parallel(cli, teacher_path, pending, shard_dir):
+    import multiprocessing
+
+    groups = visible_device_groups(cli.data_parallel_size, cli.tensor_parallel_size)
+    context = multiprocessing.get_context("spawn")
+    processes = []
+    completed = False
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        for rank, devices in enumerate(groups):
+            assigned = pending[rank::len(groups)]
+            if not assigned:
+                continue
+            process = context.Process(target=rollout_worker,
+                                      args=(cli, teacher_path, assigned, shard_dir / f"rank-{rank:05d}.jsonl", devices))
+            process.start()
+            processes.append(process)
+        while any(process.is_alive() for process in processes):
+            failed = [process for process in processes if process.exitcode not in (None, 0)]
+            if failed:
+                raise RuntimeError(f"Rollout worker exited with code {failed[0].exitcode}; rerun with --resume")
+            time.sleep(0.2)
+        for process in processes:
+            process.join()
+            if process.exitcode:
+                raise RuntimeError(f"Rollout worker exited with code {process.exitcode}; rerun with --resume")
+        completed = True
+    finally:
+        # On failure also stop GPU-engine children of a worker that already died.
+        for process in processes:
+            if not completed:
+                if os.name == "posix":
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        if process.is_alive():
+                            process.terminate()
+                elif process.is_alive():
+                    process.terminate()
+                process.join(timeout=10)
+                if process.is_alive():
+                    if os.name == "posix":
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            process.kill()
+                    else:
+                        process.kill()
+                    process.join()
+
+
 def main():
     cli = parse_args()
     if int(os.environ.get("WORLD_SIZE", "1")) > 1:
-        raise RuntimeError("Launch stage 1 with Python, not torchrun; use --tensor-parallel-size for multiple GPUs")
+        raise RuntimeError("Launch with Python and --data-parallel-size N; torchrun is not needed for independent replicas")
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     import pyarrow.parquet as pq
-    from transformers import AutoConfig, AutoTokenizer, GenerationConfig
-    from vllm import LLM, SamplingParams
+    from transformers import AutoConfig, AutoTokenizer
 
     teacher_path = cli.teacher_model_path.expanduser().resolve()
     if not cli.data_path.is_file() or not (teacher_path / "config.json").is_file():
@@ -125,6 +276,7 @@ def main():
     for index, row in enumerate(source_rows[:cli.limit]):
         ids = tokenizer.apply_chat_template(prepare_example(row)["prompt"], tokenize=True,
                                             add_generation_prompt=True, enable_thinking=cli.enable_thinking)
+        ids = ids if isinstance(ids, list) else ids["input_ids"]
         if len(ids) <= cli.max_prompt_length:
             questions.append({"question_id": index, "prompt": row["prompt"], "prompt_token_ids": ids})
     if not questions:
@@ -141,7 +293,9 @@ def main():
                      if (teacher_path / "generation_config.json").is_file() else None,
                  **{name: getattr(cli, name) for name in ("num_rollouts", "max_new_tokens", "max_prompt_length",
                     "max_model_len", "temperature", "top_p", "top_k", "enable_thinking", "seed", "limit")}}
-    if output_path.exists() or meta_path.exists():
+    shard_dir = output_path.with_suffix(".parts")
+    shard_paths = sorted(shard_dir.glob("rank-*.jsonl"))
+    if output_path.exists() or meta_path.exists() or shard_paths:
         if not cli.resume:
             raise FileExistsError("Rollout output exists; use --resume or a different --output-path")
         if not meta_path.is_file() or json.loads(meta_path.read_text(encoding="utf-8"))["signature"] != signature:
@@ -149,7 +303,7 @@ def main():
     elif cli.resume:
         raise FileNotFoundError("No rollout output metadata to resume")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    seen, stopped, truncated = scan_existing(output_path, cli.num_rollouts, repair_tail=cli.resume)
+    seen, stopped, truncated = scan_cache_files([output_path, *shard_paths], cli.num_rollouts, repair_tail=cli.resume)
     valid_ids = {question["question_id"] for question in questions}
     if any(qid not in valid_ids for qid, _ in seen):
         raise ValueError("Cached question IDs do not match this input selection")
@@ -158,7 +312,8 @@ def main():
     pending = [(question, indices) for question, indices in pending if indices]
     metadata = {"signature": signature, "complete": False, "source_questions": len(source_rows),
                 "selected_questions": min(cli.limit or len(source_rows), len(source_rows)),
-                "usable_questions": len(questions), "expected_responses": len(questions) * cli.num_rollouts}
+                "usable_questions": len(questions), "expected_responses": len(questions) * cli.num_rollouts,
+                "data_parallel_size": cli.data_parallel_size, "tensor_parallel_size": cli.tensor_parallel_size}
 
     def save_metadata(complete=False):
         metadata.update(complete=complete, saved_responses=len(seen), stopped_responses=stopped,
@@ -169,35 +324,25 @@ def main():
 
     save_metadata()
     if pending:
-        generation_path = teacher_path / "generation_config.json"
-        eos = (GenerationConfig.from_pretrained(str(teacher_path), local_files_only=True).eos_token_id
-               if generation_path.is_file() else tokenizer.eos_token_id)
-        stop_ids = eos if isinstance(eos, list) else [eos] if eos is not None else []
-        engine = LLM(model=str(teacher_path), tokenizer=str(teacher_path), dtype="bfloat16",
-                     tensor_parallel_size=cli.tensor_parallel_size, gpu_memory_utilization=cli.gpu_memory_utilization,
-                     max_model_len=cli.max_model_len, max_num_seqs=cli.max_num_seqs,
-                     enable_prefix_caching=True, generation_config="vllm", seed=cli.seed)
-        with output_path.open("a", encoding="utf-8", newline="\n") as handle:
-            for start in range(0, len(pending), cli.batch_size):
-                batch = pending[start:start + cli.batch_size]
-                params = [SamplingParams(n=len(indices), max_tokens=cli.max_new_tokens,
-                                         temperature=cli.temperature, top_p=cli.top_p, top_k=cli.top_k,
-                                         stop_token_ids=stop_ids, seed=cli.seed + question["question_id"])
-                          for question, indices in batch]
-                outputs = engine.generate([{"prompt_token_ids": question["prompt_token_ids"]} for question, _ in batch],
-                                          params, use_tqdm=True)
-                if len(outputs) != len(batch):
-                    raise ValueError("vLLM returned an unexpected number of requests")
-                for (question, indices), output in zip(batch, outputs, strict=True):
-                    for record in output_records(question, output, indices):
-                        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-                        seen.add((record["question_id"], record["sample_id"]))
-                        stopped += int(record["finish_reason"] == "stop")
-                        truncated += int(record["finish_reason"] == "length")
-                handle.flush()
-                os.fsync(handle.fileno())
+        if cli.data_parallel_size == 1:
+            def on_batch(records):
+                nonlocal stopped, truncated
+                for record in records:
+                    seen.add((record["question_id"], record["sample_id"]))
+                    stopped += int(record["finish_reason"] == "stop")
+                    truncated += int(record["finish_reason"] == "length")
                 save_metadata()
-                print(f"Saved {len(seen)}/{metadata['expected_responses']} responses; length-limited={truncated}", flush=True)
+            generate_responses(cli, teacher_path, pending, output_path, on_batch=on_batch)
+        else:
+            run_parallel(cli, teacher_path, pending, shard_dir)
+            shard_paths = sorted(shard_dir.glob("rank-*.jsonl"))
+            seen, stopped, truncated = scan_cache_files([output_path, *shard_paths], cli.num_rollouts)
+    if len(seen) != metadata["expected_responses"]:
+        raise ValueError("Generation is incomplete; rerun with --resume")
+    if shard_paths:
+        merge_cache_files(output_path, [output_path, *shard_paths], metadata["expected_responses"])
+        for path in shard_paths:
+            path.unlink()  # The atomic merged output now contains these rows.
     save_metadata(complete=True)
     print(f"Rollouts ready: {output_path}; stopped={stopped}, length-limited={truncated}. "
           "Align excludes length-limited answers without cropping them.", flush=True)

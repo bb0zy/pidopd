@@ -15,3 +15,5 @@ dataset/train/dapo-17k.parquet
 dataset/train/dapo-17k-teacher.jsonl
 dataset/train/dapo-17k-teacher.meta.json
 dataset/train/dapo-17k-teacher.meta.tmp
+dataset/train/dapo-17k-teacher.parts/
+dataset/train/dapo-17k-teacher.merge.tmp

@@ -67,7 +67,7 @@ def arguments(argv=None):
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--max-model-len", type=int, default=40960)
     p.add_argument("--max-new-tokens", type=int, default=38912)
-    p.add_argument("--samples", type=int, choices=[16,32], default=32, help="avg@32 requires 32 completions per question")
+    p.add_argument("--samples", type=int, choices=[16,32], default=16, help="avg@n requires n completions per question")
     p.add_argument("--temperature", type=float, default=0.6)
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--seed", type=int, default=42)

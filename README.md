@@ -29,6 +29,9 @@ vLLM 使用服务器现有的定制版 0.19.1，需兼容 Transformers 5.3.0；
 # 第一阶段：vLLM，每题默认1条；改为 --num-rollouts 4 可生成4条
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m train.teacher_rollout
 
+# 第一阶段也支持双卡数据并行，每卡各加载一份教师并分摊题目
+CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python -m train.teacher_rollout --data-parallel-size 2
+
 # 第二阶段：单卡全量分布对齐
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m train.align_train
 
@@ -42,8 +45,10 @@ CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python -m torch.distributed.run \
 prompt 上限1024，超长题目过滤。生成温度0.7、top-p=0.8、top-k=20，默认关闭 thinking。
 增加预算示例：`--max-new-tokens 32768 --max-model-len 40960`，需模型支持；
 第二阶段相应设置 `--max-length 40960`。达到长度上限的回答会保存，但对齐时过滤，完整回答不裁剪。
-生成续跑追加 `--resume`。第一阶段双卡用 `CUDA_VISIBLE_DEVICES=0,1` 和
-`--tensor-parallel-size 2`，使用普通 Python 启动，无需 `torchrun`。
+生成续跑追加 `--resume`，只补生成缺失回答，支持续跑时更换卡数。
+第一阶段使用普通 Python 启动；多卡设置 `--data-parallel-size <卡数>` 及对应可见 GPU。
+各进程先写 `.parts/` 分片，结束后自动合并到同一 JSONL，Align 命令不变。
+`--batch-size` 和 `--max-num-seqs` 按每个实例计算；TP 默认1，原有 `--tensor-parallel-size` 仍可使用。
 
 第二阶段使用 [TRL GKD](https://huggingface.co/docs/trl/v1.13.0/en/gkd_trainer)：
 `lmbda=0、seq_kd=False、beta=0、temperature=1`，整条回答及 EOS 上拟合教师全词表分布，无硬标签 CE。
