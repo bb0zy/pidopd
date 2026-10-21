@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 import re
 import statistics
+import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -18,14 +20,46 @@ for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE",
     os.environ[key] = "1"
 
 ROOT = Path(__file__).resolve().parents[1]
-MODEL_ROOT = Path("/models")
+CHECKPOINT_ROOT = ROOT / "train/grpo_checkpoint"
 LEGACY_SUFFIX = r"Please reason step by step, and put your final answer within \boxed{}."
 SYSTEM_PROMPT = r"""Solve the following math problem step by step.
 The last line of your response should contain only the final answer enclosed in \boxed{}."""
 
-def arguments():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", type=Path, default=MODEL_ROOT / "qwen")
+def checkpoint_paths(directory, selection="all"):
+    """Discover complete training checkpoints in numeric step order."""
+    if not directory.is_dir():
+        raise ValueError(f"Checkpoint directory does not exist: {directory}")
+    candidates = sorted(
+        (path for path in directory.iterdir()
+         if path.is_dir() and re.fullmatch(r"checkpoint-\d+", path.name)),
+        key=lambda path: int(path.name.split("-")[-1]),
+    )
+    if selection not in {"all", "latest"}:
+        if not re.fullmatch(r"\d+", selection):
+            raise ValueError("--checkpoint must be all, latest, or a step number (e.g. 100)")
+        candidates = [path for path in candidates if int(path.name.split("-")[-1]) == int(selection)]
+    weights = ("model.safetensors", "model.safetensors.index.json",
+               "pytorch_model.bin", "pytorch_model.bin.index.json")
+    complete = []
+    for path in candidates:
+        if (path / "config.json").is_file() and (path / "trainer_state.json").is_file() and any(
+            (path / name).is_file() for name in weights
+        ):
+            complete.append(path)
+        else:
+            print(f"Skipping incomplete checkpoint: {path}", flush=True)
+    if not complete:
+        raise ValueError(f"No complete checkpoint found in {directory} for selection {selection!r}")
+    return complete[-1:] if selection == "latest" else complete
+
+
+def arguments(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    source = p.add_mutually_exclusive_group()
+    source.add_argument("--model", type=Path, help="Evaluate one complete local model directory")
+    source.add_argument("--checkpoint-dir", type=Path,
+                        help=f"Scan checkpoint-* directories (default: {CHECKPOINT_ROOT})")
+    p.add_argument("--checkpoint", default="all", help="Checkpoint selection: all (default), latest, or a step number")
     p.add_argument("--lora-path", type=Path, help="Local LoRA adapter directory, including a training checkpoint")
     p.add_argument("--data", type=Path, default=ROOT / "dataset/eval")
     p.add_argument("--output", type=Path, default=ROOT / "eval/results")
@@ -48,7 +82,7 @@ def arguments():
     p.add_argument("--plain-prompt", action="store_true", help="Base model without chat template")
     p.add_argument("--chat-template-kwargs", default="{}", help='JSON, e.g. {"enable_thinking":true}')
     p.add_argument("--trust-remote-code", action="store_true", help="Allow custom code in local model")
-    a = p.parse_args()
+    a = p.parse_args(argv)
     for name in ("batch_size", "max_model_len", "max_new_tokens", "samples", "tensor_parallel_size", "max_num_seqs"):
         if getattr(a, name) < 1:
             p.error(f"{name} must be positive")
@@ -64,10 +98,23 @@ def arguments():
         p.error("Use positive temperature for multiple independent samples")
     if a.backend == "transformers" and a.tensor_parallel_size != 1:
         p.error("Transformers backend uses one GPU; tensor parallelism is vLLM-only")
-    a.model = a.model.expanduser().resolve()
     a.data = a.data.expanduser().resolve()
-    if not a.model.is_dir() or not (a.model / "config.json").is_file():
-        p.error(f"Expected complete local model directory with config.json: {a.model}")
+    a.output = a.output.expanduser().resolve()
+    a.checkpoint_paths = []
+    if a.model is None:
+        if a.lora_path is not None:
+            p.error("--lora-path requires an explicit --model base-model path")
+        a.checkpoint_dir = (a.checkpoint_dir or CHECKPOINT_ROOT).expanduser().resolve()
+        try:
+            a.checkpoint_paths = checkpoint_paths(a.checkpoint_dir, a.checkpoint)
+        except ValueError as exc:
+            p.error(str(exc))
+    else:
+        if a.checkpoint != "all":
+            p.error("--checkpoint is only used when scanning a checkpoint directory")
+        a.model = a.model.expanduser().resolve()
+        if not a.model.is_dir() or not (a.model / "config.json").is_file():
+            p.error(f"Expected complete local model directory with config.json: {a.model}")
     a.tokenizer_path = a.model
     a.lora_rank = None
     if a.lora_path is not None:
@@ -275,8 +322,7 @@ class TransformersBackend:
                 for i in range(0, len(completions), self.a.samples)]
 
 
-def main():
-    a = arguments()
+def evaluate(a):
     from answer_grader import AnswerGrader
     import torch
     from transformers import AutoTokenizer, set_seed
@@ -388,6 +434,60 @@ def main():
         (run_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps({name: metrics}, ensure_ascii=False, indent=2), flush=True)
     print(f"Results: {run_dir}")
+
+
+def checkpoint_command(checkpoint, output, argv):
+    """Forward evaluation options while replacing checkpoint selection and output."""
+    forwarded = []
+    tokens = iter(argv)
+    for token in tokens:
+        if token.split("=", 1)[0] in {"--checkpoint-dir", "--checkpoint", "--output"}:
+            if "=" not in token:
+                next(tokens)
+        else:
+            forwarded.append(token)
+    # GRPO training explicitly disables thinking by default. An explicit eval
+    # override is forwarded unchanged for experiments trained with thinking on.
+    if not any(token.split("=", 1)[0] == "--chat-template-kwargs" for token in forwarded):
+        forwarded.extend(["--chat-template-kwargs", '{"enable_thinking":false}'])
+    return [sys.executable, str(Path(__file__).resolve()), *forwarded,
+            "--model", str(checkpoint), "--output", str(output)]
+
+
+def evaluate_checkpoints(a, argv):
+    """Use a fresh process per checkpoint so vLLM/CUDA memory is fully released."""
+    run_dir = a.output / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    run_dir.mkdir(parents=True, exist_ok=False)
+    summary = {"checkpoint_dir": str(a.checkpoint_dir), "checkpoints": {}}
+    failed = []
+    for checkpoint in a.checkpoint_paths:
+        output = run_dir / checkpoint.name
+        print(f"Evaluating {checkpoint.name} ({checkpoint})", flush=True)
+        result = subprocess.run(checkpoint_command(checkpoint, output, argv), check=False)
+        summaries = sorted(output.glob("*/summary.json"))
+        entry = {"model": str(checkpoint), "step": int(checkpoint.name.split("-")[-1]),
+                 "returncode": result.returncode}
+        if result.returncode == 0 and summaries:
+            entry["result_dir"] = str(summaries[-1].parent)
+            entry["metrics"] = json.loads(summaries[-1].read_text(encoding="utf-8"))
+        else:
+            entry["error"] = "Evaluation failed or did not produce summary.json"
+            failed.append(checkpoint.name)
+        summary["checkpoints"][checkpoint.name] = entry
+        (run_dir / "summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"Checkpoint comparison: {run_dir / 'summary.json'}", flush=True)
+    if failed:
+        raise RuntimeError(f"Failed checkpoints: {', '.join(failed)}; see {run_dir / 'summary.json'}")
+
+
+def main():
+    argv = sys.argv[1:]
+    a = arguments(argv)
+    if a.checkpoint_paths:
+        evaluate_checkpoints(a, argv)
+    else:
+        evaluate(a)
 
 
 if __name__ == "__main__":

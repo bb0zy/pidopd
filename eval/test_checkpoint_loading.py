@@ -1,4 +1,4 @@
-"""Check base-model and adapter routing without loading GPU dependencies."""
+"""Check complete checkpoint discovery, batch evaluation, and model routing on CPU."""
 import contextlib
 import importlib.util
 import io
@@ -26,6 +26,7 @@ class CheckpointLoadingTests(unittest.TestCase):
         (self.base / "config.json").write_text("{}", encoding="utf-8")
         self.data = root / "questions.json"
         self.data.write_text("[]", encoding="utf-8")
+        self.checkpoint_dir = root / "grpo_checkpoint"
         self.adapters = [root / "outputs" / "qwen", root / "checkpoint" / "qwen" / "checkpoint-50"]
         for adapter in self.adapters:
             adapter.mkdir(parents=True, exist_ok=True)
@@ -38,6 +39,106 @@ class CheckpointLoadingTests(unittest.TestCase):
             argv.extend(["--lora-path", str(adapter)])
         with patch.object(sys, "argv", argv + list(extra)):
             return run_eval.arguments()
+
+    def create_checkpoint(self, step):
+        checkpoint = self.checkpoint_dir / f"checkpoint-{step}"
+        checkpoint.mkdir(parents=True)
+        for name in ("config.json", "trainer_state.json", "tokenizer_config.json"):
+            (checkpoint / name).write_text("{}", encoding="utf-8")
+        (checkpoint / "model.safetensors").write_bytes(b"")
+        return checkpoint.resolve()
+
+    def test_default_scans_checkpoints_in_numeric_order(self):
+        expected = [self.create_checkpoint(step) for step in (50, 200, 1000)]
+        (self.checkpoint_dir / "final").mkdir()
+        incomplete = self.checkpoint_dir / "checkpoint-2000"
+        incomplete.mkdir()
+        (incomplete / "config.json").write_text("{}", encoding="utf-8")
+        with patch.object(run_eval, "CHECKPOINT_ROOT", self.checkpoint_dir), contextlib.redirect_stdout(io.StringIO()):
+            args = run_eval.arguments(["--data", str(self.data)])
+        self.assertEqual(args.checkpoint_paths, expected)
+        self.assertIsNone(args.model)
+        self.assertIsNone(args.lora_path)
+        self.assertEqual(run_eval.checkpoint_paths(self.checkpoint_dir, "200"), [expected[1]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(run_eval.checkpoint_paths(self.checkpoint_dir, "latest"), [expected[-1]])
+
+    def test_checkpoint_selection_and_explicit_model(self):
+        checkpoint = self.create_checkpoint(100)
+        args = run_eval.arguments(["--checkpoint-dir", str(self.checkpoint_dir),
+                                  "--checkpoint", "100", "--data", str(self.data)])
+        self.assertEqual(args.checkpoint_paths, [checkpoint])
+        direct = run_eval.arguments(["--model", str(checkpoint), "--data", str(self.data)])
+        self.assertEqual(direct.model, checkpoint)
+        self.assertEqual(direct.tokenizer_path, checkpoint)
+        self.assertFalse(direct.checkpoint_paths)
+        self.assertIsNone(direct.lora_path)
+        with self.assertRaises(ValueError):
+            run_eval.checkpoint_paths(self.checkpoint_dir, "999")
+        with self.assertRaises(ValueError):
+            run_eval.checkpoint_paths(self.checkpoint_dir, "invalid")
+
+    def test_checkpoint_child_command_preserves_options_and_replaces_selection(self):
+        checkpoint = self.create_checkpoint(100)
+        output = Path(self.temp.name) / "results"
+        command = run_eval.checkpoint_command(checkpoint, output, [
+            "--checkpoint-dir=" + str(self.checkpoint_dir), "--checkpoint", "latest",
+            "--output", "old-output", "--backend", "transformers", "--samples=16",
+            "--data", str(self.data), "--limit", "5",
+        ])
+        self.assertEqual(command[:2], [sys.executable, str(Path(run_eval.__file__).resolve())])
+        self.assertNotIn("--checkpoint", command)
+        self.assertNotIn("old-output", command)
+        child = run_eval.arguments(command[2:])
+        self.assertEqual(child.model, checkpoint)
+        self.assertEqual(child.output, output.resolve())
+        self.assertEqual((child.backend, child.samples, child.limit), ("transformers", 16, 5))
+        self.assertEqual(child.template_kwargs, {"enable_thinking": False})
+        self.assertFalse(child.checkpoint_paths)
+        override = run_eval.checkpoint_command(checkpoint, output, [
+            "--data", str(self.data), "--chat-template-kwargs", '{"enable_thinking":true}',
+        ])
+        self.assertEqual(run_eval.arguments(override[2:]).template_kwargs, {"enable_thinking": True})
+
+    def test_checkpoint_evaluations_are_isolated_and_aggregated(self):
+        checkpoints = [self.create_checkpoint(step) for step in (100, 200)]
+        args = run_eval.arguments(["--checkpoint-dir", str(self.checkpoint_dir),
+                                  "--data", str(self.data), "--output", str(Path(self.temp.name) / "results")])
+
+        def evaluate_child(command, check):
+            child = run_eval.arguments(command[2:])
+            result_dir = child.output / "test-run"
+            result_dir.mkdir(parents=True)
+            (result_dir / "summary.json").write_text(json.dumps({
+                "datasets": {"aime24.parquet": {"avg@32": 0.5}},
+            }), encoding="utf-8")
+            return SimpleNamespace(returncode=0)
+
+        with patch.object(run_eval.subprocess, "run", side_effect=evaluate_child) as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            run_eval.evaluate_checkpoints(args, ["--checkpoint-dir", str(self.checkpoint_dir),
+                                                "--data", str(self.data)])
+        self.assertEqual(run.call_count, 2)
+        summaries = list(args.output.glob("*/summary.json"))
+        self.assertEqual(len(summaries), 1)
+        summary = json.loads(summaries[0].read_text(encoding="utf-8"))["checkpoints"]
+        self.assertEqual(list(summary), [path.name for path in checkpoints])
+        for checkpoint in checkpoints:
+            self.assertEqual(summary[checkpoint.name]["model"], str(checkpoint))
+            self.assertEqual(summary[checkpoint.name]["metrics"]["datasets"]["aime24.parquet"]["avg@32"], 0.5)
+
+    def test_checkpoint_failures_are_reported_without_skipping_later_checkpoints(self):
+        self.create_checkpoint(100)
+        self.create_checkpoint(200)
+        args = run_eval.arguments(["--checkpoint-dir", str(self.checkpoint_dir),
+                                  "--data", str(self.data), "--output", str(Path(self.temp.name) / "failed-results")])
+        with patch.object(run_eval.subprocess, "run", return_value=SimpleNamespace(returncode=1)) as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "checkpoint-100, checkpoint-200"):
+                run_eval.evaluate_checkpoints(args, [])
+        self.assertEqual(run.call_count, 2)
+        summary = json.loads(next(args.output.glob("*/summary.json")).read_text(encoding="utf-8"))
+        self.assertTrue(all(entry["returncode"] == 1 for entry in summary["checkpoints"].values()))
 
     def test_paths_and_tokenizer_fallback(self):
         base_args = self.args()

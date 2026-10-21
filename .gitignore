@@ -7,7 +7,11 @@ wandb/
 train/outputs/
 train/checkpoint/
 train/grpo_checkpoint/
+train/align_checkpoint/
 .DS_Store
 dataset/train/train-00000-of-00002.parquet
 dataset/train/train-00001-of-00002.parquet
 dataset/train/dapo-17k.parquet
+dataset/train/dapo-17k-teacher.jsonl
+dataset/train/dapo-17k-teacher.meta.json
+dataset/train/dapo-17k-teacher.meta.tmp
