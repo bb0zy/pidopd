@@ -15,7 +15,7 @@ python -m pip check
 vLLM 使用服务器现有的定制版 0.19.1，需兼容 Transformers 5.3.0；
 未包含在安装清单中，单独安装。模型与数据均从本地读取。
 
-下方 GRPO 和 Align 命令假设虚拟环境位于 `.venv`，请按实际路径替换
+下方 GRPO、DAPO 和 Align 命令假设虚拟环境位于 `.venv`，请按实际路径替换
 `.venv/bin/python`，无需先激活环境。多卡通过该 Python 执行
 `-m torch.distributed.run`（等价于 `torchrun`），确保使用指定虚拟环境。
 
@@ -109,6 +109,33 @@ CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python -m torch.distributed.run \
 可用 `--output-dir` 分开保存不同实验。单卡若要保持双卡默认的有效 batch，
 设置 `--gradient-accumulation-steps 32`。
 
+## DAPO 全量微调
+
+入口：[train/dapo_train.py](train/dapo_train.py)，模型、数据和 system prompt 与 GRPO 相同。
+默认非思考模式、最多生成 **10,240 tokens**，训练1,000步；每100步保存完整模型及续训状态到
+`train/dapo_checkpoint/checkpoint-<step>/`，最终模型在 `final/`。
+
+```bash
+# 单卡
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m train.dapo_train
+
+# 双卡 DDP
+CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python -m torch.distributed.run \
+  --standalone --nproc_per_node=2 --module train.dapo_train
+```
+
+包含 DAPO token loss、上下裁剪0.2/0.28、动态采样（过滤全对/全错题组并补足）和超长惩罚。
+默认 KL=0、学习率1e-6、每题8条；针对长回答使用每卡 microbatch=1、累积64，
+每步仍为每卡64条筛选后的回答。vLLM colocate TP=1、sleep mode 和50%引擎显存预算与 GRPO 一致。
+超过8192 tokens 后线性扣分，在10240处达到-0.5（对应本项目0/1正确性奖励尺度）；截断回答不参与 loss。
+动态采样最多16轮，未补足时明确报错，可用 `--max-sampling-rounds` 调整。
+
+续训追加 `--resume-from-checkpoint latest`；长度用 `--max-new-tokens` 或 `--max-completion-length`；
+保留 KL 可设置 `--beta 0.04`。日志 `dapo/raw_accuracy` 是筛选前正确率，
+`dapo/group_acceptance_rate` 是题组保留率；`reward` 则是筛选后含长度惩罚的奖励，不能直接当作正确率。
+动态采样依赖项目固定的 `trl==1.13.0`，多卡同步和显存峰值仍需在服务器验证。
+评测使用 `python eval/run_eval.py --checkpoint-dir train/dapo_checkpoint --checkpoint 100`。
+
 ## 教师引导的 LoRA 训练
 
 入口：[train/main.py](train/main.py)，配置见 [train/myconfig.py](train/myconfig.py)。
@@ -171,6 +198,7 @@ CUDA_VISIBLE_DEVICES=0 python eval/run_eval.py --model train/grpo_checkpoint/fin
 python -B -m unittest train.test_teacher_rollout -v
 python -B -m unittest train.test_align_train -v
 python -B -m unittest train.test_grpo_train -v
+python -B -m unittest train.test_dapo_train -v
 python -B -m unittest train.test_student_generation -v
 python -B -m unittest train.test_teacher_client -v
 python -B -m unittest train.test_loss_regularization -v
