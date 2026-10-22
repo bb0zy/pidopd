@@ -1,6 +1,6 @@
 """Offline math evaluation. See the project root README.md; no downloads or training."""
 from __future__ import annotations
-
+# CUDA_VISIBLE_DEVICES=3 python eval/run_eval.py --checkpoint 500
 import argparse
 import importlib.metadata
 import json
@@ -73,14 +73,14 @@ def arguments(argv=None):
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--limit", type=int, help="First N rows per file")
     p.add_argument("--tensor-parallel-size", type=int, default=1)
-    p.add_argument("--max-num-seqs", type=int, default=32, help="vLLM scheduler concurrency")
+    p.add_argument("--max-num-seqs", type=int, default=128, help="vLLM scheduler concurrency")
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     p.add_argument("--dtype", choices=["auto", "bfloat16", "float16", "float32"], default="bfloat16")
     p.add_argument("--warmup", type=int, default=1, help="Untimed warmup calls")
     p.add_argument("--prompt-key", help="Optional dotted field path")
     p.add_argument("--answer-key", help="Optional dotted field path")
     p.add_argument("--plain-prompt", action="store_true", help="Base model without chat template")
-    p.add_argument("--chat-template-kwargs", default="{}", help='JSON, e.g. {"enable_thinking":true}')
+    p.add_argument("--chat-template-kwargs", default='{"enable_thinking":false}', help='JSON, e.g. {"enable_thinking":true}')
     p.add_argument("--trust-remote-code", action="store_true", help="Allow custom code in local model")
     a = p.parse_args(argv)
     for name in ("batch_size", "max_model_len", "max_new_tokens", "samples", "tensor_parallel_size", "max_num_seqs"):
@@ -262,6 +262,7 @@ class VLLMBackend:
                          trust_remote_code=a.trust_remote_code,
                          tensor_parallel_size=a.tensor_parallel_size,
                          max_num_seqs=a.max_num_seqs,
+                         max_num_batched_tokens = 65536,
                          gpu_memory_utilization=a.gpu_memory_utilization,
                          max_model_len=a.max_model_len, seed=a.seed,
                          enable_prefix_caching=False, generation_config="vllm", **lora_kwargs)
