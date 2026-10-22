@@ -1,0 +1,59 @@
+{
+  "primary_metric": "avg@32",
+  "samples_per_question": 16,
+  "model_load_seconds": 49.45090626878664,
+  "datasets": {
+    "aime24.parquet": {
+      "questions": 30,
+      "completions": 480,
+      "avg@32": 0.13125,
+      "generation_seconds": 2341.816268119961,
+      "output_tokens": 1849804,
+      "output_tokens_per_second": 789.9014218929505,
+      "completions_per_second": 0.2049691115970212,
+      "mean_batch_seconds": 156.12108454133073,
+      "median_batch_seconds": 28.92507264809683,
+      "length_finish_rate": 0.03125,
+      "answer_extraction_failure_rate": 0.03125
+    },
+    "aime25.parquet": {
+      "questions": 30,
+      "completions": 480,
+      "avg@32": 0.07083333333333333,
+      "generation_seconds": 1207.2612319518812,
+      "output_tokens": 1151579,
+      "output_tokens_per_second": 953.8772301485611,
+      "completions_per_second": 0.3975941472285526,
+      "mean_batch_seconds": 80.48408213012542,
+      "median_batch_seconds": 27.313378767110407,
+      "length_finish_rate": 0.0125,
+      "answer_extraction_failure_rate": 0.010416666666666666
+    },
+    "aime26.jsonl": {
+      "questions": 30,
+      "completions": 480,
+      "avg@32": 0.075,
+      "generation_seconds": 2642.6741441846825,
+      "output_tokens": 1848574,
+      "output_tokens_per_second": 699.5088683437821,
+      "completions_per_second": 0.18163419847137058,
+      "mean_batch_seconds": 176.17827627897884,
+      "median_batch_seconds": 70.3759143827483,
+      "length_finish_rate": 0.03333333333333333,
+      "answer_extraction_failure_rate": 0.03125
+    },
+    "hmmt_feb.parquet": {
+      "questions": 30,
+      "completions": 480,
+      "avg@32": 0.03958333333333333,
+      "generation_seconds": 998.190691227559,
+      "output_tokens": 972380,
+      "output_tokens_per_second": 974.1425246153944,
+      "completions_per_second": 0.4808700423860932,
+      "mean_batch_seconds": 66.54604608183726,
+      "median_batch_seconds": 30.777974692173302,
+      "length_finish_rate": 0.00625,
+      "answer_extraction_failure_rate": 0.00625
+    }
+  }
+}

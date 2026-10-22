@@ -1,0 +1,59 @@
+{
+  "primary_metric": "avg@32",
+  "samples_per_question": 16,
+  "model_load_seconds": 50.653338256292045,
+  "datasets": {
+    "aime24.parquet": {
+      "questions": 30,
+      "completions": 480,
+      "avg@32": 0.11875,
+      "generation_seconds": 2958.478719345294,
+      "output_tokens": 1898165,
+      "output_tokens_per_second": 641.6017081982122,
+      "completions_per_second": 0.16224554763950547,
+      "mean_batch_seconds": 197.2319146230196,
+      "median_batch_seconds": 228.28333337930962,
+      "length_finish_rate": 0.03333333333333333,
+      "answer_extraction_failure_rate": 0.029166666666666667
+    },
+    "aime25.parquet": {
+      "questions": 30,
+      "completions": 480,
+      "avg@32": 0.07916666666666666,
+      "generation_seconds": 784.8002901212312,
+      "output_tokens": 1026798,
+      "output_tokens_per_second": 1308.3557854462395,
+      "completions_per_second": 0.6116205690059728,
+      "mean_batch_seconds": 52.32001934141542,
+      "median_batch_seconds": 25.813527286984026,
+      "length_finish_rate": 0.004166666666666667,
+      "answer_extraction_failure_rate": 0.004166666666666667
+    },
+    "aime26.jsonl": {
+      "questions": 30,
+      "completions": 480,
+      "avg@32": 0.08333333333333333,
+      "generation_seconds": 2235.665595504921,
+      "output_tokens": 1794581,
+      "output_tokens_per_second": 802.705468835869,
+      "completions_per_second": 0.21470116146399476,
+      "mean_batch_seconds": 149.0443730336614,
+      "median_batch_seconds": 73.23721066024154,
+      "length_finish_rate": 0.029166666666666667,
+      "answer_extraction_failure_rate": 0.029166666666666667
+    },
+    "hmmt_feb.parquet": {
+      "questions": 30,
+      "completions": 480,
+      "avg@32": 0.052083333333333336,
+      "generation_seconds": 630.3133570896462,
+      "output_tokens": 902310,
+      "output_tokens_per_second": 1431.526065330818,
+      "completions_per_second": 0.76152598481541,
+      "mean_batch_seconds": 42.020890472643075,
+      "median_batch_seconds": 27.22742763068527,
+      "length_finish_rate": 0.0020833333333333333,
+      "answer_extraction_failure_rate": 0.0020833333333333333
+    }
+  }
+}
