@@ -175,9 +175,9 @@ def parse_args(argv=None):
     parser.add_argument("--data-path", type=Path, default=PROJECT_ROOT / "dataset/train/dapo-17k.parquet")
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "train/dapo_checkpoint")
     parser.add_argument("--max-steps", type=int, default=1000, help="Optimizer updates, not sampling rounds")
-    parser.add_argument("--per-device-train-batch-size", type=int, default=8,
+    parser.add_argument("--per-device-train-batch-size", type=int, default=2,
                         help="Conservative microbatch for 10240-token full-parameter training")
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
     parser.add_argument("--num-generations", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--beta", type=float, default=0.0, help="Reference KL coefficient; DAPO default is zero")
