@@ -175,9 +175,9 @@ def parse_args(argv=None):
     parser.add_argument("--data-path", type=Path, default=PROJECT_ROOT / "dataset/train/dapo-17k.parquet")
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "train/dapo_checkpoint")
     parser.add_argument("--max-steps", type=int, default=1000, help="Optimizer updates, not sampling rounds")
-    parser.add_argument("--per-device-train-batch-size", type=int, default=1,
+    parser.add_argument("--per-device-train-batch-size", type=int, default=8,
                         help="Conservative microbatch for 10240-token full-parameter training")
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=64)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--num-generations", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--beta", type=float, default=0.0, help="Reference KL coefficient; DAPO default is zero")
@@ -192,7 +192,7 @@ def parse_args(argv=None):
                         help="Fail if dynamic sampling cannot fill every rank within this many rounds")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.3)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.4)
     parser.add_argument("--vllm-enable-sleep-mode", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume-from-checkpoint", nargs="?", const="latest", default=None)
     parser.add_argument("--report-to", choices=("none", "wandb", "tensorboard"), default="none")
