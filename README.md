@@ -117,10 +117,10 @@ CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python -m torch.distributed.run \
 
 ```bash
 # 单卡
-CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m train.dapo_train
+CUDA_VISIBLE_DEVICES=0 python -m train.dapo_train
 
 # 双卡 DDP
-CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python -m torch.distributed.run \
+CUDA_VISIBLE_DEVICES=0,3 python -m torch.distributed.run \
   --standalone --nproc_per_node=2 --module train.dapo_train
 ```
 
