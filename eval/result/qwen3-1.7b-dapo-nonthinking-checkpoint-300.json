@@ -1,0 +1,70 @@
+{
+  "checkpoint_dir": "/ossfs/workspace/pidopd/train/dapo_checkpoint",
+  "checkpoints": {
+    "checkpoint-300": {
+      "model": "/ossfs/workspace/pidopd/train/dapo_checkpoint/checkpoint-300",
+      "step": 300,
+      "returncode": 0,
+      "result_dir": "/ossfs/workspace/pidopd/eval/results/20261104T063057_240635Z/checkpoint-300/20261104T063224_564560Z",
+      "metrics": {
+        "primary_metric": "avg@32",
+        "samples_per_question": 16,
+        "model_load_seconds": 211.01161626493558,
+        "datasets": {
+          "aime24.parquet": {
+            "questions": 30,
+            "completions": 480,
+            "avg@32": 0.13125,
+            "generation_seconds": 2286.7988807649817,
+            "output_tokens": 1827724,
+            "output_tokens_per_second": 799.2499976161386,
+            "completions_per_second": 0.2099004000909035,
+            "mean_batch_seconds": 152.45325871766545,
+            "median_batch_seconds": 43.10573436296545,
+            "length_finish_rate": 0.025,
+            "answer_extraction_failure_rate": 0.025
+          },
+          "aime25.parquet": {
+            "questions": 30,
+            "completions": 480,
+            "avg@32": 0.07083333333333333,
+            "generation_seconds": 1140.274025250459,
+            "output_tokens": 1180234,
+            "output_tokens_per_second": 1035.0441857524236,
+            "completions_per_second": 0.4209514462057214,
+            "mean_batch_seconds": 76.01826835003061,
+            "median_batch_seconds": 24.406479046912864,
+            "length_finish_rate": 0.010416666666666666,
+            "answer_extraction_failure_rate": 0.008333333333333333
+          },
+          "aime26.jsonl": {
+            "questions": 30,
+            "completions": 480,
+            "avg@32": 0.075,
+            "generation_seconds": 2282.979815456085,
+            "output_tokens": 1751704,
+            "output_tokens_per_second": 767.2884307345711,
+            "completions_per_second": 0.21025153036848354,
+            "mean_batch_seconds": 152.198654363739,
+            "median_batch_seconds": 77.69570936798118,
+            "length_finish_rate": 0.025,
+            "answer_extraction_failure_rate": 0.025
+          },
+          "hmmt_feb.parquet": {
+            "questions": 30,
+            "completions": 480,
+            "avg@32": 0.03958333333333333,
+            "generation_seconds": 942.4647229418624,
+            "output_tokens": 1026332,
+            "output_tokens_per_second": 1088.9871790599755,
+            "completions_per_second": 0.5093028824481631,
+            "mean_batch_seconds": 62.830981529457496,
+            "median_batch_seconds": 29.062981236027554,
+            "length_finish_rate": 0.00625,
+            "answer_extraction_failure_rate": 0.00625
+          }
+        }
+      }
+    }
+  }
+}
