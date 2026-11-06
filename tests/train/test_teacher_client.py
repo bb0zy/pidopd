@@ -86,78 +86,52 @@ class TeacherTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "teacher_max_model_len=2"):
                 score_candidates(PrefixModel(), [[1, 2, 3]], [2], [[[0, 1]]], 2, 2)
 
-    def test_worker_loads_once_and_returns_only_candidates(self):
-        model = Mock()
-        model.to.return_value = model
-        model.eval.return_value = model
-        loader = SimpleNamespace(from_pretrained=Mock(return_value=model))
-        request = ("teacher", [[1, 2, 3]], [2], [[[4, 0]]])
+    def test_worker_loads_both_teachers_and_frozen_student_once(self):
+        models = [Mock(), Mock(), Mock()]
+        for model in models:
+            model.to.return_value = model
+        paths = {"before": "/before", "after": "/after", "reference": "/student"}
+        inputs = ([[1, 2, 3]], [2], [[[4, 0]]])
+        tokenizer = SimpleNamespace(get_vocab=lambda: {str(i): i for i in range(7)})
         connection = Mock()
-        connection.recv.side_effect = [request, request, None]
-        small_scores = array_tensor([[-1, -2]], dtype=np.float32)
+        connection.recv.side_effect = [(kind, *inputs) for kind in ("before", "after", "reference", "after")] + [None]
         with (
-            patch.dict("sys.modules", {"transformers": SimpleNamespace(AutoModelForCausalLM=loader)}),
+            patch.dict("sys.modules", {"transformers": SimpleNamespace(AutoTokenizer=SimpleNamespace(
+                from_pretrained=Mock(return_value=tokenizer)))}),
             patch.dict(os.environ),
-            patch("train.teacher_client.score_candidates", return_value=small_scores) as scorer,
+            patch("train.teacher_client.tokenizer_source", side_effect=lambda p: p),
+            patch("train.teacher_client.load_frozen_model", side_effect=models) as loader,
+            patch("train.teacher_client.score_candidates", return_value=array_tensor([[-1, -2]], dtype=np.float32)) as scorer,
         ):
-            _run_teacher(connection, "1", "/models/teacher", None, 8192, 256)
-            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "1")
-        loader.from_pretrained.assert_called_once_with("/models/teacher", local_files_only=True, dtype="auto")
-        model.to.assert_called_once_with("cuda")
-        model.requires_grad_.assert_called_once_with(False)
-        self.assertEqual(scorer.call_count, 2)
+            _run_teacher(connection, "2", paths, "/student", 8192, 256)
+            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "2")
+        self.assertEqual([c.args[0] for c in loader.call_args_list], list(paths.values()))
+        self.assertEqual([c.args[0] for c in scorer.call_args_list], [*models, models[1]])
+        self.assertEqual(connection.send.call_count, 5)
         np.testing.assert_array_equal(connection.send.call_args.args[0][1], [[-1, -2]])
         connection.close.assert_called_once()
 
     def test_worker_propagates_load_error(self):
         loader = SimpleNamespace(from_pretrained=Mock(side_effect=ValueError("bad model")))
         connection = Mock()
-        with patch.dict("sys.modules", {"transformers": SimpleNamespace(AutoModelForCausalLM=loader)}), patch.dict(os.environ):
-            _run_teacher(connection, "1", "/missing", None, 8192, 256)
+        with patch.dict("sys.modules", {"transformers": SimpleNamespace(AutoTokenizer=loader)}), patch.dict(os.environ):
+            _run_teacher(connection, "1", {"before": "/missing"}, "/student", 8192, 256)
         success, error = connection.send.call_args.args[0]
         self.assertFalse(success)
         self.assertIn("bad model", error)
 
-    def test_client_receives_compact_float32_array(self):
+    def test_client_routes_three_independent_policies(self):
         client = TeacherClient.__new__(TeacherClient)
         client.connection = Mock()
         client.connection.recv.return_value = (True, np.array([[-1, -2]], dtype=np.float32))
+        inputs = ([[1, 2]], [1], [[[0, 3]]])
         with patch.dict("sys.modules", {"torch": ARRAY_TORCH}):
-            scores = client.score([[1, 2]], [1], [[[0, 3]]])
-        self.assertEqual(scores.shape, (1, 2))
-        self.assertEqual(scores.dtype, np.float32)
-
-    def test_frozen_base_routes_separately_from_teacher(self):
-        teacher = Mock()
-        reference = Mock()
-        for model in (teacher, reference):
-            model.to.return_value = model
-            model.eval.return_value = model
-        loader = SimpleNamespace(from_pretrained=Mock(side_effect=[teacher, reference]))
-        inputs = ([[1, 2, 3]], [2], [[[4, 0]]])
-        connection = Mock()
-        connection.recv.side_effect = [("teacher", *inputs), ("reference", *inputs), None]
-        with (
-            patch.dict("sys.modules", {"transformers": SimpleNamespace(AutoModelForCausalLM=loader)}),
-            patch.dict(os.environ),
-            patch("train.teacher_client.score_candidates", return_value=array_tensor([[-1, -2]], dtype=np.float32)) as scorer,
-        ):
-            _run_teacher(connection, "1", "/models/teacher", "/models/student", 8192, 256)
-        self.assertEqual(
-            [call.args[0] for call in loader.from_pretrained.call_args_list],
-            ["/models/teacher", "/models/student"],
-        )
-        teacher.requires_grad_.assert_called_once_with(False)
-        reference.requires_grad_.assert_called_once_with(False)
-        self.assertIs(scorer.call_args_list[0].args[0], teacher)
-        self.assertIs(scorer.call_args_list[1].args[0], reference)
-
-        client = TeacherClient.__new__(TeacherClient)
-        client.connection = Mock()
-        client.connection.recv.return_value = (True, np.array([[-1, -2]], dtype=np.float32))
-        with patch.dict("sys.modules", {"torch": ARRAY_TORCH}):
-            client.score_reference(*inputs)
-        self.assertEqual(client.connection.send.call_args.args[0][0], "reference")
+            for method, name in ((client.score_before, "before"), (client.score_after, "after"),
+                                 (client.score_reference, "reference")):
+                scores = method(*inputs)
+                self.assertEqual(scores.shape, (1, 2))
+                self.assertEqual(scores.dtype, np.float32)
+                self.assertEqual(client.connection.send.call_args.args[0], (name, *inputs))
 
 
 @unittest.skipUnless(

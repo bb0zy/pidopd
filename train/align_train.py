@@ -1,24 +1,21 @@
-r"""Stage 2: offline forward-KL distillation of cached teacher responses.
+r"""Stage 2: offline student-top-k distillation on cached teacher responses.
 
-    CUDA_VISIBLE_DEVICES=0 python -m train.align_train
+    CUDA_VISIBLE_DEVICES=0 python -m train.align_train --loss-top-k 16
     CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m train.align_train
 
-Student: /models/qwen3-1.7b; frozen teacher: /models/qwen3-4b-1.
-Every 100 optimizer updates save a full student checkpoint in train/align_checkpoint.
-Resume with --resume-from-checkpoint latest; final student is saved in final/.
+Run train.teacher_rollout first. This stage never generates responses.
+A frozen teacher scores the student's top-k candidates at each cached response
+position. The loss uses Direct-OPD's detached student-top-k weighting, with
+log p_teacher - log p_student as the reward (a reverse-KL gradient approximation).
+Log probabilities are normalized over each model's full vocabulary. Prompt and
+padding are masked, reasoning and EOS are included. Only the student is updated,
+using full-parameter training, not LoRA. No hard-label CE or initial-student KL.
 
-Run python -m train.teacher_rollout first. This stage NEVER generates responses.
-TRL 1.13 GKD: lmbda=0, seq_kd=False, beta=0, temperature=1.
-The student matches the frozen teacher's full-vocabulary distribution at every
-cached response token, including reasoning and EOS. Prompts/padding are masked.
-Length-limited and overlong responses are filtered, never cropped. Liger's fused
-GKD loss bounds logits memory for long responses; no vLLM engine is loaded here.
-
-Parameter basis: https://huggingface.co/docs/trl/v1.13.0/en/gkd_trainer
-GKD's default learning rate is 2e-5. Here 1e-5 is a conservative starting point
-for full-parameter alignment of an already post-trained Qwen3 on 17k examples.
-Use one epoch, effective batch 32 per GPU, linear decay, and 3% warmup. These
-are project starting values, not an experimentally established optimum.
+By default, checkpointed, chunked output projections avoid storing sequence-length
+x vocabulary logits. Use --logit-chunk-size -1 to compute all response positions
+at once, without head recomputation. Liger is not required by this top-k loss.
+Full checkpoints are saved every 100 steps in train/align_checkpoint; resume with
+--resume-from-checkpoint latest. Final student: train/align_checkpoint/final/.
 """
 
 import argparse
@@ -57,7 +54,7 @@ def validate_rollout_metadata(data_path, teacher_path, tokenizer):
 
 def validate_tokenizers(student, teacher):
     if student.get_vocab() != teacher.get_vocab():
-        raise ValueError("Forward-KL KD requires identical token-to-ID mappings for student and teacher")
+        raise ValueError("Top-k KD requires identical token-to-ID mappings for student and teacher")
     for name in ("bos_token_id", "eos_token_id"):
         if getattr(student, name) != getattr(teacher, name):
             raise ValueError(f"Student and teacher must share {name}")
@@ -78,17 +75,21 @@ def parse_args(argv=None):
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
     parser.add_argument("--max-length", type=int, default=32768, help="Filter longer full sequences; never crop responses")
-    parser.add_argument("--use-liger-kernel", action=argparse.BooleanOptionalAction, default=True,
-                        help="Fused full-vocabulary GKD loss; disabling may use much more GPU memory")
+    parser.add_argument("--loss-top-k", "--top-k", type=int, default=16,
+                        help="Student top-k candidate support; log-probs use full-vocabulary normalization")
+    parser.add_argument("--logit-chunk-size", type=int, default=128,
+                        help="Response positions per output projection; -1 computes all valid positions at once")
     parser.add_argument("--resume-from-checkpoint", nargs="?", const="latest", default=None)
     parser.add_argument("--report-to", choices=("none", "wandb", "tensorboard"), default="none")
     parser.add_argument("--seed", type=int, default=42)
     cli = parser.parse_args(argv)
     if cli.max_steps != -1 and cli.max_steps < 1:
         parser.error("--max-steps must be -1 or positive")
-    for name in ("per_device_train_batch_size", "gradient_accumulation_steps", "max_length"):
+    for name in ("per_device_train_batch_size", "gradient_accumulation_steps", "max_length", "loss_top_k"):
         if getattr(cli, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if cli.logit_chunk_size != -1 and cli.logit_chunk_size < 1:
+        parser.error("--logit-chunk-size must be -1 or positive")
     if not math.isfinite(cli.learning_rate) or cli.learning_rate <= 0:
         parser.error("--learning-rate must be finite and positive")
     if not math.isfinite(cli.num_train_epochs) or cli.num_train_epochs <= 0:
@@ -100,8 +101,8 @@ def parse_args(argv=None):
 
 def main():
     cli = parse_args()
-    # These lightweight shared helpers do not import Torch/TRL or start GRPO.
-    from .grpo_train import configure_launch, validate_full_checkpoint
+    # These lightweight helpers select devices before Torch/TRL is imported.
+    from .rl_train import configure_launch, resolve_full_resume
 
     world_size, local_rank = configure_launch()
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -111,13 +112,8 @@ def main():
     import torch
     from datasets import Dataset
     from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
-    from transformers.trainer_utils import get_last_checkpoint
     from trl.experimental.gkd import GKDConfig
-    from trl.import_utils import is_liger_kernel_available
     from .offline_gkd import OfflineGKDTrainer
-
-    if cli.use_liger_kernel and not is_liger_kernel_available():
-        raise ImportError("Long-sequence alignment requires liger-kernel>=0.8.2; install project requirements")
 
     if not torch.cuda.is_available() or local_rank >= torch.cuda.device_count():
         raise RuntimeError("KD training requires a visible CUDA GPU for this process")
@@ -131,18 +127,7 @@ def main():
     if not cli.data_path.is_file():
         raise FileNotFoundError(cli.data_path)
     output_dir = cli.output_dir.expanduser().resolve()
-    last = get_last_checkpoint(str(output_dir)) if output_dir.is_dir() else None
-    resume = cli.resume_from_checkpoint
-    if resume == "latest":
-        if last is None:
-            raise FileNotFoundError(f"No checkpoint-* directory in {output_dir}")
-        resume = last
-    elif resume is not None:
-        resume = str(Path(resume).expanduser().resolve())
-    elif last is not None or (output_dir / "final").exists():
-        raise FileExistsError("Output contains a run; use --resume-from-checkpoint latest or a new --output-dir")
-    if resume is not None:
-        validate_full_checkpoint(resume)
+    resume = resolve_full_resume(output_dir, cli.resume_from_checkpoint)
 
     tokenizer = AutoTokenizer.from_pretrained(str(student_path), local_files_only=True, padding_side="right")
     teacher_tokenizer = AutoTokenizer.from_pretrained(str(teacher_path), local_files_only=True)
@@ -160,7 +145,7 @@ def main():
     accepted = raw.filter(usable_rollout, fn_kwargs={"max_length": cli.max_length},
                           desc="Keep complete teacher responses without truncation")
     train_dataset = accepted.map(alignment_example, remove_columns=accepted.column_names,
-                                 desc="Use exact cached teacher tokens for full-response KL")
+                                 desc="Use cached teacher prefixes for student-top-k distillation")
     if not len(train_dataset):
         raise ValueError("No training examples remain after length filtering")
     effective_batch = cli.per_device_train_batch_size * world_size * cli.gradient_accumulation_steps
@@ -173,7 +158,7 @@ def main():
         output_dir=str(output_dir),
         lmbda=0.0,
         seq_kd=False,
-        beta=0.0,
+        beta=1.0,
         temperature=1.0,
         max_length=cli.max_length,
         num_train_epochs=cli.num_train_epochs,
@@ -193,7 +178,7 @@ def main():
         gradient_checkpointing_kwargs={"use_reentrant": False},
         ddp_find_unused_parameters=False,
         disable_dropout=True,
-        use_liger_kernel=cli.use_liger_kernel,
+        use_liger_kernel=False,
         packing=False,
         shuffle_dataset=True,
         remove_unused_columns=False,
@@ -227,7 +212,8 @@ def main():
             raise ValueError(f"max-length exceeds {name} context length {context}")
     trainer = OfflineGKDTrainer(model=student, teacher_model=teacher, args=args,
                          processing_class=tokenizer, data_collator=OfflineKDCollator(tokenizer.pad_token_id),
-                         train_dataset=train_dataset)
+                         train_dataset=train_dataset, loss_top_k=cli.loss_top_k,
+                         logit_chunk_size=cli.logit_chunk_size)
     # Cached labels are available before training_step, so Trainer can count the
     # actual response tokens across accumulation batches for GKD normalization.
     trainer.model_accepts_loss_kwargs = True
@@ -236,15 +222,17 @@ def main():
         metadata = {**vars(cli), "world_size": world_size, "effective_batch": effective_batch,
                     "raw_examples": len(raw), "usable_examples": len(train_dataset),
                     "estimated_optimizer_steps": total_steps, "warmup_steps": warmup_steps,
-                    "objective": "forward_kl_teacher_to_student", "temperature": 1.0,
-                    "lmbda": 0.0, "seq_kd": False, "beta": 0.0,
+                    "objective": "student_topk_reverse_kl_surrogate", "temperature": 1.0,
+                    "candidate_selection": "student_topk", "probability_normalization": "full_vocabulary",
+                    "candidate_weighting": "renormalized_student_topk_detached",
+                    "lmbda": 0.0, "seq_kd": False, "beta": 1.0,
                     "loss_positions": "all_teacher_generated_response_tokens_and_eos",
                     "loss_normalization": "response_token_count_across_accumulation_batches",
                     "rollout_metadata": rollout_metadata,
                     "student_parameter_dtype": "float32", "teacher_parameter_dtype": "bfloat16"}
         (output_dir / "align_run_config.json").write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
-        print(f"Offline forward-KL KD: {len(train_dataset)}/{len(raw)} responses kept (no cropping); effective batch {effective_batch}; "
+        print(f"Offline student-top-{cli.loss_top_k} KD: {len(train_dataset)}/{len(raw)} responses kept (no cropping); effective batch {effective_batch}; "
               f"~{total_steps} optimizer updates; save every 100 updates", flush=True)
     result = trainer.train(resume_from_checkpoint=resume)
     trainer.save_model(str(output_dir / "final"))

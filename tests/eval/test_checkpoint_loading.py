@@ -1,6 +1,5 @@
 """Check complete checkpoint discovery, batch evaluation, and model routing on CPU."""
 import contextlib
-import importlib.util
 import io
 import json
 from pathlib import Path
@@ -11,16 +10,14 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 
-spec = importlib.util.spec_from_file_location("run_eval", Path(__file__).with_name("run_eval.py"))
-run_eval = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(run_eval)
+from eval import run_eval
 
 
 class CheckpointLoadingTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        root = Path(self.temp.name)
+        root = Path(self.temp.name).resolve()
         self.base = root / "base"
         self.base.mkdir()
         (self.base / "config.json").write_text("{}", encoding="utf-8")
@@ -144,7 +141,7 @@ class CheckpointLoadingTests(unittest.TestCase):
         base_args = self.args()
         self.assertIsNone(base_args.lora_path)
         self.assertEqual(base_args.tokenizer_path, self.base.resolve())
-        self.assertEqual(base_args.max_num_seqs, 32)
+        self.assertEqual(base_args.max_num_seqs, 128)
         self.assertEqual(self.args(None, "--max-num-seqs", "8").max_num_seqs, 8)
         for adapter in self.adapters:
             with self.subTest(adapter=adapter):
@@ -230,7 +227,7 @@ class CheckpointLoadingTests(unittest.TestCase):
                         base, str(adapter.resolve()), local_files_only=True, is_trainable=False)
                     self.assertIs(backend.model, adapted)
                 self.assertEqual(backend.config.eos_token_id, 2)
-                self.assertEqual(backend.config.num_return_sequences, 32)
+                self.assertEqual(backend.config.num_return_sequences, backend.a.samples)
 
 
 if __name__ == "__main__":

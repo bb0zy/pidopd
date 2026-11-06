@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 from train import kd_data, teacher_rollout
-from train.test_align_train import FakeTokenizer
+from tests.train.test_align_train import FakeTokenizer
 
 
 def write_cpu_rollouts(cli, teacher_path, pending, output_path, visible_devices):

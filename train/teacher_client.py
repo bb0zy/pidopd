@@ -5,6 +5,8 @@ import multiprocessing as mp
 import os
 import traceback
 
+from .direct_opd import build_token_map, load_frozen_model, remap_tokens, tokenizer_source
+
 
 def score_candidates(model, token_ids, prompt_lengths, candidate_ids, max_length, chunk_size):
     """Score student candidates with full-vocabulary normalization on the model device."""
@@ -44,30 +46,29 @@ def score_candidates(model, token_ids, prompt_lengths, candidate_ids, max_length
     return torch.cat(scores, dim=0)
 
 
-def _run_teacher(connection, gpu, model_path, reference_model_path, max_length, chunk_size):
+def _run_teacher(connection, gpu, model_paths, student_tokenizer_path, max_length, chunk_size):
     # Set visibility before importing CUDA libraries in this fresh spawn process.
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu
     try:
-        from transformers import AutoModelForCausalLM
+        from transformers import AutoTokenizer
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path, local_files_only=True, dtype="auto",
-        ).to("cuda").eval()
-        model.requires_grad_(False)
-        reference_model = None
-        if reference_model_path is not None:
-            reference_model = AutoModelForCausalLM.from_pretrained(
-                reference_model_path, local_files_only=True, dtype="auto",
-            ).to("cuda").eval()
-            reference_model.requires_grad_(False)
+        student_tokenizer = AutoTokenizer.from_pretrained(student_tokenizer_path, local_files_only=True)
+        models, mappings = {}, {}
+        for name, path in model_paths.items():
+            teacher_tokenizer = AutoTokenizer.from_pretrained(tokenizer_source(path), local_files_only=True)
+            mappings[name] = build_token_map(student_tokenizer, teacher_tokenizer)
+            models[name] = load_frozen_model(path).to("cuda")
         connection.send((True, None))
         while True:
             request = connection.recv()
             if request is None:
                 break
             model_kind, token_ids, prompt_lengths, candidate_ids = request
+            if model_kind not in models:
+                raise ValueError(f"Scoring model is not loaded: {model_kind}")
+            token_ids, candidate_ids = remap_tokens(token_ids, candidate_ids, mappings[model_kind])
             scores = score_candidates(
-                reference_model if model_kind == "reference" else model,
+                models[model_kind],
                 token_ids, prompt_lengths, candidate_ids, max_length, chunk_size,
             )
             # Send only [total_answer_tokens, K] as a compact CPU array, never full logits.
@@ -81,18 +82,26 @@ def _run_teacher(connection, gpu, model_path, reference_model_path, max_length, 
 
 
 class TeacherClient:
-    def __init__(self, model_path, reference_model_path=None, gpu="1", max_length=8192, chunk_size=256):
+    def __init__(self, model_before_path, model_after_path, student_tokenizer_path,
+                 reference_model_path=None, gpu="1", max_length=8192, chunk_size=256):
+        model_paths = {"before": model_before_path, "after": model_after_path}
+        if reference_model_path is not None:
+            model_paths["reference"] = reference_model_path
         context = mp.get_context("spawn")
         self.connection, child_connection = context.Pipe()
         self.process = context.Process(
             target=_run_teacher,
-            args=(child_connection, gpu, model_path, reference_model_path, max_length, chunk_size),
-            name="transformers-teacher",
+            args=(child_connection, gpu, model_paths, student_tokenizer_path, max_length, chunk_size),
+            name="direct-opd-teachers",
         )
         self.process.start()
         child_connection.close()
         atexit.register(self.close)
-        self._receive()
+        try:
+            self._receive()
+        except BaseException:
+            self.close()
+            raise
 
     def _receive(self):
         success, result = self.connection.recv()
@@ -107,8 +116,11 @@ class TeacherClient:
         self.connection.send((model_kind, token_ids, prompt_lengths, candidate_ids))
         return torch.from_numpy(self._receive())
 
-    def score(self, token_ids, prompt_lengths, candidate_ids):
-        return self._score("teacher", token_ids, prompt_lengths, candidate_ids)
+    def score_before(self, token_ids, prompt_lengths, candidate_ids):
+        return self._score("before", token_ids, prompt_lengths, candidate_ids)
+
+    def score_after(self, token_ids, prompt_lengths, candidate_ids):
+        return self._score("after", token_ids, prompt_lengths, candidate_ids)
 
     def score_reference(self, token_ids, prompt_lengths, candidate_ids):
         return self._score("reference", token_ids, prompt_lengths, candidate_ids)

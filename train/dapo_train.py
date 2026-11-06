@@ -14,8 +14,6 @@ this is not a reproduction of the paper's 32B training scale.
 """
 
 import argparse
-import json
-import os
 from pathlib import Path
 import random
 import sys
@@ -25,13 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from train.grpo_train import (
-    accuracy_reward,
-    configure_launch,
-    get_answer_grader,
-    prepare_example,
-    validate_full_checkpoint,
-)
+from train.rl_train import accuracy_reward, run_training
 
 
 def make_overlong_reward(max_length, buffer_length, penalty):
@@ -221,159 +213,10 @@ def parse_args(argv=None):
 
 def main():
     cli = parse_args()
-    world_size, local_rank = configure_launch()
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-
-    import torch
-    from datasets import Dataset
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from transformers.trainer_utils import get_last_checkpoint
-    from trl import GRPOConfig, GRPOTrainer
-    from importlib.metadata import version
-
-    if version("trl") != "1.13.0":
-        raise RuntimeError("DAPO dynamic sampling requires the project's pinned trl==1.13.0")
-
-    class DAPOTrainer(DynamicSamplingMixin, GRPOTrainer):
-        pass
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("DAPO with vLLM requires an NVIDIA CUDA GPU")
-    if local_rank >= torch.cuda.device_count():
-        raise RuntimeError(f"LOCAL_RANK={local_rank} has no visible CUDA device; check CUDA_VISIBLE_DEVICES and torchrun")
-    torch.cuda.set_device(local_rank)
-    effective_batch = cli.per_device_train_batch_size * world_size * cli.gradient_accumulation_steps
-    if effective_batch % cli.num_generations:
-        raise ValueError("Effective batch size must be divisible by --num-generations")
-    model_path = Path(cli.model_path).expanduser().resolve()
-    if not model_path.is_dir():
-        raise FileNotFoundError(f"Local model directory not found: {model_path}")
-    if not cli.data_path.is_file():
-        raise FileNotFoundError(cli.data_path)
-    output_dir = cli.output_dir.resolve()
-    last_checkpoint = get_last_checkpoint(str(output_dir)) if output_dir.is_dir() else None
-    resume = cli.resume_from_checkpoint
-    if resume == "latest":
-        if last_checkpoint is None:
-            raise FileNotFoundError(f"No checkpoint-* directory in {output_dir}")
-        resume = last_checkpoint
-    elif resume is not None:
-        resume = str(Path(resume).expanduser().resolve())
-    elif last_checkpoint is not None or (output_dir / "final").exists():
-        raise FileExistsError("Output already contains a run; use --resume-from-checkpoint latest or a new --output-dir")
-    if resume is not None:
-        validate_full_checkpoint(resume)
-
-    tokenizer = AutoTokenizer.from_pretrained(str(model_path), local_files_only=True, padding_side="left")
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    chat_kwargs = {"enable_thinking": cli.enable_thinking}
-    raw_dataset = Dataset.from_parquet(str(cli.data_path.resolve()), cache_dir=str(PROJECT_ROOT / "tmp/datasets"))
-    train_dataset = raw_dataset.map(prepare_example, remove_columns=raw_dataset.column_names,
-                                    desc="Prepare DAPO prompts and reference answers")
-
-    def within_context(example):
-        # TRL 1.13 has no max_prompt_length; account for the actual chat template.
-        ids = tokenizer.apply_chat_template(example["prompt"], tokenize=True,
-                                            add_generation_prompt=True, **chat_kwargs)
-        ids = ids if isinstance(ids, list) else ids["input_ids"]
-        return len(ids) <= cli.max_prompt_length
-
-    train_dataset = train_dataset.filter(within_context, desc="Filter overlong prompts without truncation")
-    if len(train_dataset) < effective_batch // cli.num_generations:
-        raise ValueError("Not enough usable questions for one generation batch")
-    # Fail before allocating the model if any reference cannot be graded.
-    for gold in set(train_dataset["answer"]):
-        get_answer_grader(gold)
-
-    args = GRPOConfig(
-        output_dir=str(output_dir),
-        max_steps=cli.max_steps,
-        per_device_train_batch_size=cli.per_device_train_batch_size,
-        gradient_accumulation_steps=cli.gradient_accumulation_steps,
-        # One dynamically filled rollout batch per optimizer update.
-        steps_per_generation=cli.gradient_accumulation_steps,
-        num_generations=cli.num_generations,
-        num_iterations=1,
-        learning_rate=cli.learning_rate,
-        lr_scheduler_type="constant_with_warmup",
-        warmup_steps=min(20, max(0, cli.max_steps - 1)),
-        optim="adamw_torch_fused",
-        weight_decay=0.0,
-        max_grad_norm=1.0,
-        beta=cli.beta,
-        epsilon=cli.epsilon,
-        epsilon_high=cli.epsilon_high,
-        loss_type="dapo",
-        scale_rewards="group",
-        max_completion_length=cli.max_completion_length,
-        temperature=cli.temperature,
-        top_p=1.0,
-        top_k=0,
-        chat_template_kwargs=chat_kwargs,
-        mask_truncated_completions=True,
-        use_vllm=True,
-        vllm_mode="colocate",
-        vllm_tensor_parallel_size=1,
-        vllm_gpu_memory_utilization=cli.vllm_gpu_memory_utilization,
-        vllm_max_model_length=cli.max_prompt_length + cli.max_completion_length,
-        vllm_enable_sleep_mode=cli.vllm_enable_sleep_mode,
-        vllm_importance_sampling_correction=True,
-        vllm_importance_sampling_mode="token_truncate",
-        vllm_importance_sampling_clip_max=2.0,
-        bf16=True,
-        fp16=False,
-        tf32=True,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        ddp_find_unused_parameters=False,
-        disable_dropout=True,
-        remove_unused_columns=False,
-        eval_strategy="no",
-        report_to=cli.report_to,
-        run_name="qwen3-1.7b-dapo-full",
-        logging_steps=1,
-        logging_first_step=True,
-        save_strategy="steps",
-        save_steps=100,
-        save_total_limit=None,
-        save_only_model=False,
-        seed=cli.seed,
-        data_seed=cli.seed,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        str(model_path), local_files_only=True, dtype=torch.bfloat16,
-        attn_implementation="sdpa",  # No separate flash-attn installation needed.
-    )
-    model.config.use_cache = False
-    model.requires_grad_(True)
-    total_parameters = sum(parameter.numel() for parameter in model.parameters())
-    trainer = DAPOTrainer(
-        model=model, args=args, train_dataset=train_dataset, processing_class=tokenizer,
-        reward_funcs=[accuracy_reward, make_overlong_reward(
-            cli.max_completion_length, cli.overlong_buffer_length, cli.overlong_penalty)],
-        max_sampling_rounds=cli.max_sampling_rounds,
-    )
-    if trainer.is_world_process_zero():
-        output_dir.mkdir(parents=True, exist_ok=True)
-        metadata = {**vars(cli), "world_size": world_size, "finetuning_type": "full",
-                    "algorithm": "dapo", "loss_type": "dapo", "trl_version": version("trl"),
-                    "trainable_parameters": total_parameters,
-                    "raw_questions": len(raw_dataset), "usable_questions": len(train_dataset),
-                    "completions_per_update": effective_batch,
-                    "questions_per_update": effective_batch // cli.num_generations}
-        (output_dir / "dapo_run_config.json").write_text(
-            json.dumps(metadata, indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
-        print(f"Full-parameter DAPO: {total_parameters:,} parameters on {world_size} GPU(s); "
-              f"questions: {len(train_dataset)}/{len(raw_dataset)}; {effective_batch} completions/update; "
-              f"{effective_batch // cli.num_generations} accepted question groups/update; {cli.max_steps} optimizer steps", flush=True)
-    result = trainer.train(resume_from_checkpoint=resume)
-    trainer.save_model(str(output_dir / "final"))
-    trainer.log_metrics("train", result.metrics)
-    trainer.save_metrics("train", result.metrics)
-    trainer.save_state()
+    run_training(cli, trainer_mixin=DynamicSamplingMixin, reward_funcs=[
+        accuracy_reward,
+        make_overlong_reward(cli.max_completion_length, cli.overlong_buffer_length, cli.overlong_penalty),
+    ])
 
 
 if __name__ == "__main__":

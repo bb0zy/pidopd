@@ -1,202 +1,112 @@
+"""Direct-OPD on student-generated trajectories, with vLLM weight synchronization."""
 
-from collections.abc import Callable
-from typing import Any
+from pathlib import Path
 
-import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from accelerate.logging import get_logger
-from datasets import Dataset
-from transformers import (
-    BaseImageProcessor,
-    DataCollator,
-    FeatureExtractionMixin,
-    PreTrainedModel,
-    PreTrainedTokenizerBase,
-    ProcessorMixin,
-    TrainerCallback,
-)
-from transformers.trainer_utils import EvalPrediction
-from transformers.utils import is_peft_available
-
+from transformers import TrainerCallback
 from trl import SFTTrainer
 from trl.trainer.utils import disable_dropout_in_model
 
-from .myconfig import MyConfig
-from .utils import myDataCollator
-from .teacher_client import TeacherClient
+from .direct_opd import DirectOPDState, direct_opd_loss, tokenizer_source
 from .student_generation import StudentGeneration
+from .teacher_client import TeacherClient
+from .utils import myDataCollator
 
 
-if is_peft_available():
-    from peft import PeftConfig
+class DirectOPDCallback(TrainerCallback):
+    def __init__(self, trainer):
+        self.trainer = trainer
 
-
-logger = get_logger(__name__)
-
-
-def coarse_kl_loss(student_log_probs, reference_log_probs):
-    """KL over selected tokens plus one bucket for the remaining vocabulary."""
-    student_probs = student_log_probs.exp()
-    reference_probs = reference_log_probs.exp()
-    student_other = (1 - student_probs.sum(dim=-1)).clamp_min(1e-8)
-    reference_other = (1 - reference_probs.sum(dim=-1)).clamp_min(1e-8)
-    selected_kl = (student_probs * (student_log_probs - reference_log_probs)).sum(dim=-1)
-    other_kl = student_other * (student_other.log() - reference_other.log())
-    return (selected_kl + other_kl).mean()
+    def on_step_end(self, args, state, control, **kwargs):
+        opd = self.trainer.opd_state
+        reward = opd.reward_sum / max(opd.reward_count, 1)
+        # Accumulate all microbatches; use the resulting coefficient on the next optimizer step.
+        opd.finish_step(args.adaptive_kl, args.alpha_epsilon, args.alpha_min, args.alpha_max)
+        if state.global_step % args.logging_steps == 0:
+            self.trainer.log({"opd/alpha": opd.alpha, "opd/dense_reward": reward, **self.trainer.opd_metrics})
 
 
 class MyTrainer(SFTTrainer):
-    def __init__(
-        self,
-        model: PreTrainedModel | nn.Module | str | None = None,
-        teacher_model: str | None = None,
-        args: MyConfig | None = None,
-        data_collator: DataCollator | None = None,  # type: ignore
-        train_dataset: Dataset | None = None,
-        eval_dataset: Dataset | dict[str, Dataset] | None = None,
-        processing_class: PreTrainedTokenizerBase
-        | BaseImageProcessor
-        | FeatureExtractionMixin
-        | ProcessorMixin
-        | None = None,
-        compute_metrics: Callable[[EvalPrediction], dict] | None = None,
-        callbacks: list[TrainerCallback] | None = None,
-        optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
-        preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
-        peft_config: "PeftConfig | None" = None,
-        formatting_func: Callable | None = None,
-    ):
-        # Ensure Trainer does not drop non-signature columns used by the collator (e.g., "prompts")
+    def __init__(self, model, args, train_dataset, processing_class, opd_state=None, **kwargs):
         args.remove_unused_columns = False
-        # Respect a user-provided data_collator; otherwise, provide a ChatML collator that
-        if data_collator is None:
-            data_collator = myDataCollator(tokenizer=processing_class, max_length=args.max_length)
-
-        # Ensure SFTTrainer does not pre-process the dataset when using a ChatML collator,
-        # so that raw conversational fields (e.g., "messages") remain available to the collator.
-        if args.dataset_kwargs is None:
-            args.dataset_kwargs = {"skip_prepare_dataset": True}
-        else:
-            args.dataset_kwargs["skip_prepare_dataset"] = True
-
-        super().__init__(
-            model,
-            args=args,
-            data_collator=data_collator,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            processing_class=processing_class,
-            compute_metrics=compute_metrics,
-            callbacks=callbacks,
-            optimizers=optimizers,
-            preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-            peft_config=peft_config,
-            formatting_func=formatting_func,
-        )
-
-        # The loss uses a per-micro-batch token mean; let Trainer scale gradient accumulation.
+        args.dataset_kwargs = {**(args.dataset_kwargs or {}), "skip_prepare_dataset": True}
+        collator = kwargs.pop("data_collator", None)
+        if collator is None:
+            collator = myDataCollator(processing_class, args.max_length, args.enable_thinking)
+        super().__init__(model=model, args=args, train_dataset=train_dataset,
+                         processing_class=processing_class, data_collator=collator, **kwargs)
+        if self.accelerator.num_processes != 1:
+            raise ValueError("Direct-OPD currently uses one training process and an external vLLM server")
+        # Trainer scales gradient accumulation; this loss is a mean over answer tokens.
         self.model_accepts_loss_kwargs = False
-
-        # Teacher scoring and the student vLLM server share the inference GPU.
-        self.teacher_client = TeacherClient(
-            model_path=teacher_model or args.teacher_model_path,
-            reference_model_path=args.student_model_path if args.kl_beta > 0 else None,
-            gpu=args.teacher_gpu,
-            max_length=args.teacher_max_model_len,
-            chunk_size=args.teacher_score_chunk_size,
-        )
-
-        # Disable dropout in the model
+        self.opd_state = opd_state or DirectOPDState(args.kl_beta, {})
+        self.opd_metrics = {}
+        self.add_callback(DirectOPDCallback(self))
+        self.uses_reference = args.kl_beta > 0 or args.adaptive_kl
         if args.disable_dropout:
             disable_dropout_in_model(self.model)
-
+        self.teacher_client = TeacherClient(
+            model_before_path=args.model_before, model_after_path=args.model_after,
+            student_tokenizer_path=tokenizer_source(args.student_model_path),
+            reference_model_path=args.student_model_path if self.uses_reference else None,
+            gpu=args.teacher_gpu, max_length=args.teacher_max_model_len,
+            chunk_size=args.teacher_score_chunk_size,
+        )
         try:
-            self.student_generation = StudentGeneration(
-                self.model, self.accelerator, self.processing_class, args,
-            )
+            self.student_generation = StudentGeneration(self.model, self.accelerator, self.processing_class, args,
+                                                        state=self.opd_state)
         except BaseException:
             self.teacher_client.close()
             raise
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Use the same teacher model with normal and privileged prompts.
-        normal_teacher_inputs = []
-        normal_teacher_prompt_lengths = []
-        teacher_inputs = []
-        teacher_prompt_lengths = []
-        student_prompt_length = inputs["prompts"].size(1)
-        for i in range(inputs["input_ids"].size(0)):
-            input_mask = inputs["attention_mask"][i].bool()
-            normal_teacher_inputs.append(inputs["input_ids"][i][input_mask].tolist())
-
-            prompt_mask = inputs["teacher_prompt_attention_mask"][i].bool()
-            prompt_ids = inputs["teacher_prompts"][i][prompt_mask].tolist()
-            completion_mask = inputs["attention_mask"][i, student_prompt_length:].bool()
-            completion_ids = inputs["completion_ids"][i][completion_mask].tolist()
-            normal_teacher_prompt_lengths.append(len(normal_teacher_inputs[i]) - len(completion_ids))
-            teacher_inputs.append(prompt_ids + completion_ids)
-            teacher_prompt_lengths.append(len(prompt_ids))
-
-        student_outputs = model(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            use_cache=False,
-        )
-
-        # Student logits at position t - 1 predict the answer token at position t.
+        outputs = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"], use_cache=False)
         answer_mask = inputs["labels"][:, 1:] != -100
-        student_logits = student_outputs.logits[:, :-1, :][answer_mask].float()
-        topk_logits, topk_indices = student_logits.topk(self.args.loss_top_k, dim=-1)
-        answer_lengths = answer_mask.sum(dim=1).tolist()
-        candidate_ids = [
-            indices.tolist()
-            for indices in topk_indices.detach().cpu().split(answer_lengths)
-        ]
-        normal_teacher_response = self.teacher_client.score(
-            normal_teacher_inputs, normal_teacher_prompt_lengths, candidate_ids,
-        )
-        teacher_response = self.teacher_client.score(
-            teacher_inputs, teacher_prompt_lengths, candidate_ids,
-        )
-        # score() already selects [answer_tokens, K] on the teacher side.
-        r_1 = (teacher_response - normal_teacher_response).to(student_logits.device)
-        topk_weights = F.softmax(topk_logits.detach(), dim=-1)
-        r2 = topk_weights * r_1
+        if not answer_mask.any():
+            raise ValueError("Student rollout contains no answer tokens")
+        logits = outputs.logits[:, :-1, :][answer_mask].float()
+        topk_logits, indices = logits.topk(min(self.args.loss_top_k, logits.shape[-1]), dim=-1)
+        lengths = answer_mask.sum(dim=1).tolist()
+        candidates = [row.tolist() for row in indices.detach().cpu().split(lengths)]
+        sampled_ids = inputs["labels"][:, 1:][answer_mask]
+        sampled_candidates = [row.tolist() for row in sampled_ids[:, None].detach().cpu().split(lengths)]
+        token_ids = [row[mask.bool()].tolist() for row, mask in zip(inputs["input_ids"], inputs["attention_mask"])]
+        prompt_lengths = [len(row) - length for row, length in zip(token_ids, lengths)]
+        # Both teachers see exactly the student's prompt and sampled continuation.
+        before = self.teacher_client.score_before(token_ids, prompt_lengths, candidates).to(logits.device)
+        after = self.teacher_client.score_after(token_ids, prompt_lengths, candidates).to(logits.device)
+        logprobs = F.log_softmax(logits, dim=-1)
+        sampled = logprobs.gather(-1, sampled_ids[:, None]).squeeze(-1)
+        if self.uses_reference:
+            reference = self.teacher_client.score_reference(token_ids, prompt_lengths, sampled_candidates)
+            reference = reference.to(logits.device).squeeze(-1)
+        else:
+            reference = sampled.detach()
+        loss, stats = direct_opd_loss(logprobs.gather(-1, indices), topk_logits, after, before,
+                                      sampled, reference, self.opd_state.alpha)
+        if model.training:
+            self.opd_state.observe(stats["dense_reward"], indices.numel())
+        self.opd_metrics = {"opd/" + name: float(value) for name, value in stats.items() if name != "dense_reward"}
+        return (loss, outputs) if return_outputs else loss
 
-        # Normalize over the full vocabulary and keep gradients only through student log probabilities.
-        student_log_probs = F.log_softmax(student_logits, dim=-1)
-        topk_log_probs = student_log_probs.gather(dim=-1, index=topk_indices)
-        teacher_loss = -(r2 * topk_log_probs).sum(dim=-1).mean()
-        loss = teacher_loss
-        if self.args.kl_beta > 0:
-            kl_indices = student_logits.topk(self.args.kl_top_k, dim=-1).indices
-            reference_candidate_ids = [
-                indices.tolist() for indices in kl_indices.detach().cpu().split(answer_lengths)
-            ]
-            reference_log_probs = self.teacher_client.score_reference(
-                normal_teacher_inputs, normal_teacher_prompt_lengths, reference_candidate_ids,
-            ).to(student_logits.device)
-            kl_student_log_probs = student_log_probs.gather(dim=-1, index=kl_indices)
-            kl_loss = coarse_kl_loss(kl_student_log_probs, reference_log_probs)
-            loss = teacher_loss + self.args.kl_beta * kl_loss
-            if self.state.global_step % self.args.logging_steps == 0:
-                self.log({"teacher_loss": teacher_loss.detach().item(), "kl_to_base": kl_loss.detach().item()})
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        inputs = dict(inputs)
+        ids, mask, labels, completions = self.student_generation.generate(inputs)
+        inputs.update(input_ids=ids, attention_mask=mask, labels=labels, completion_ids=completions)
+        return super().training_step(model, inputs, num_items_in_batch)
 
-        # Return loss
-        return (loss, student_outputs) if return_outputs else loss
+    def train(self, resume_from_checkpoint=None, **kwargs):
+        if resume_from_checkpoint is not None:
+            self.opd_state.restore(resume_from_checkpoint)
+        return super().train(resume_from_checkpoint=resume_from_checkpoint, **kwargs)
 
-    def generate_on_policy_outputs(self, inputs):
-        return self.student_generation.generate(inputs)
+    def save_model(self, output_dir=None, _internal_call=False):
+        super().save_model(output_dir, _internal_call=_internal_call)
+        if self.args.should_save:
+            self.opd_state.save(Path(output_dir or self.args.output_dir), self.state.global_step)
 
-    def training_step(
-        self, model: nn.Module, inputs: dict[str, torch.Tensor | Any], num_items_in_batch: int | None = None
-    ) -> torch.Tensor:
-        new_input_ids, new_attention_mask, new_labels, completion_ids = self.generate_on_policy_outputs(inputs)
-        inputs["input_ids"] = new_input_ids
-        inputs["attention_mask"] = new_attention_mask
-        inputs["labels"] = new_labels
-        inputs["completion_ids"] = completion_ids
-
-        loss = super().training_step(model, inputs, num_items_in_batch)
-        return loss
+    def close(self):
+        try:
+            self.student_generation.close()
+        finally:
+            self.teacher_client.close()

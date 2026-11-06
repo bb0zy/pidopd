@@ -1,66 +1,29 @@
-from dataclasses import dataclass, field
+"""Direct-OPD settings on top of the shared TRL training arguments."""
+
+from dataclasses import dataclass
 
 from trl import SFTConfig
 
 
 @dataclass
 class MyConfig(SFTConfig):
-   
-
-    temperature: float = field(
-        default=0.9,
-        metadata={"help": "Temperature for sampling. The higher the temperature, the more random the completions."},
-    )
-    max_new_tokens: int = field(
-        default=2048,
-        metadata={"help": "Maximum number of tokens to generate per completion."},
-    )
-    loss_top_k: int = field(
-        default=16,
-        metadata={"help": "Number of student vocabulary candidates used per answer token in the loss."},
-    )
-    kl_beta: float = field(
-        default=1.0,
-        metadata={"help": "Strength of the KL constraint toward the frozen initial student model."},
-    )
-    kl_top_k: int = field(
-        default=64,
-        metadata={"help": "Candidate tokens retained individually in the coarse-grained KL; other tokens form one bucket."},
-    )
-    student_model_path: str = field(
-        default="/models/qwen3-1.7b",
-        metadata={"help": "Local model directory for the student and its tokenizer."},
-    )
-    student_vllm_server_url: str = field(
-        default="http://127.0.0.1:8000",
-        metadata={"help": "URL of the student vLLM server started with vllm/start_vllm.sh."},
-    )
-    student_vllm_group_port: int = field(
-        default=51216,
-        metadata={"help": "NCCL rendezvous port for student weight synchronization, distinct from the HTTP port."},
-    )
-    teacher_model_path: str = field(
-        default="/models/qwen3-0.6b",
-        metadata={"help": "Local model directory for the frozen Transformers teacher."},
-    )
-    teacher_gpu: str = field(
-        default="1",
-        metadata={"help": "CUDA_VISIBLE_DEVICES for the teacher process, independent of the student."},
-    )
-    teacher_max_model_len: int = field(default=8192)
-    teacher_score_chunk_size: int = field(
-        default=8192,
-        metadata={"help": "Tokens per cached teacher forward; limits full-vocabulary logits memory."},
-    )
-    disable_dropout: bool = field(
-        default=True,
-        metadata={"help": "Whether to disable dropouts in `model`."},
-    )
-    seq_kd: bool = field(
-        default=False,
-        metadata={
-            "help": "Seq_kd parameter that controls whether to perform Sequence-Level KD (can be viewed as supervised "
-            "FT on teacher-generated output)."
-        },
-    )
-
+    temperature: float = 1.0
+    top_p: float = 1.0
+    max_new_tokens: int = 1024
+    num_generations: int = 4
+    loss_top_k: int = 16
+    kl_beta: float = 1.0
+    adaptive_kl: bool = True
+    alpha_epsilon: float = 0.01
+    alpha_min: float = 0.5
+    alpha_max: float = 2.5
+    student_model_path: str = "/models/qwen3-1.7b"
+    model_before: str = "/models/DeepSeek-R1-Distill-Qwen-1.5B"
+    model_after: str = "/models/JustRL-DeepSeek-1.5B"
+    student_vllm_server_url: str = "http://127.0.0.1:8000"
+    student_vllm_group_port: int = 51216
+    teacher_gpu: str = "1"
+    teacher_max_model_len: int = 8192
+    teacher_score_chunk_size: int = 256
+    disable_dropout: bool = True
+    enable_thinking: bool = False

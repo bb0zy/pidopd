@@ -1,11 +1,8 @@
-"""CPU-only grading regression checks; intentionally not run on the dev machine.
-
-Server command: python -m unittest discover -s eval -p test_answer_grader.py
-"""
+"""CPU grading checks: python -B -m unittest tests.eval.test_answer_grader -v."""
 import unittest
 from pathlib import Path
 
-from answer_grader import AnswerGrader
+from eval.answer_grader import AnswerGrader
 
 
 class GradingTests(unittest.TestCase):
@@ -37,7 +34,7 @@ class GradingTests(unittest.TestCase):
 
     def test_every_local_reference_is_parseable(self):
         import pyarrow.parquet as pq
-        directory = Path(__file__).resolve().parents[1] / "dataset/eval"
+        directory = Path(__file__).resolve().parents[2] / "dataset/eval"
         for name in ("aime24.parquet", "aime25.parquet", "hmmt_feb.parquet"):
             for index, row in enumerate(pq.read_table(directory / name).to_pylist()):
                 with self.subTest(file=name, row=index):

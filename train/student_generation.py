@@ -10,13 +10,16 @@ def reset_prefix_cache(client):
 
 
 class StudentGeneration:
-    def __init__(self, model, accelerator, tokenizer, args):
+    def __init__(self, model, accelerator, tokenizer, args, state=None):
         from trl.generation.vllm_generation import VLLMGeneration
 
         eos_ids = model.generation_config.eos_token_id
         if isinstance(eos_ids, int):
             eos_ids = [eos_ids]
         self.pad_token_id = tokenizer.pad_token_id
+        self.num_generations = getattr(args, "num_generations", 1)
+        self.state = state
+        self.seed = getattr(args, "seed", 42)
         self.backend = VLLMGeneration(
             model=model,
             accelerator=accelerator,
@@ -27,7 +30,7 @@ class StudentGeneration:
             server_timeout=60.0,
             enable_sleep_mode=False,
             temperature=args.temperature,
-            top_p=1.0,
+            top_p=getattr(args, "top_p", 1.0),
             top_k=-1,
             max_completion_length=args.max_new_tokens,
             logprobs=None,
@@ -41,6 +44,11 @@ class StudentGeneration:
     def generate(self, inputs):
         import torch
 
+        if self.num_generations > 1:
+            inputs = {
+                "prompts": inputs["prompts"].repeat_interleave(self.num_generations, dim=0),
+                "prompt_attention_mask": inputs["prompt_attention_mask"].repeat_interleave(self.num_generations, dim=0),
+            }
         prompt_ids = [
             ids[mask.bool()].tolist()
             for ids, mask in zip(inputs["prompts"], inputs["prompt_attention_mask"])
@@ -50,10 +58,16 @@ class StudentGeneration:
             # TRL merges LoRA, streams GPU0 weights to GPU1 through NCCL, then unmerges
             # the trainable model and resets prefix caches before accepting new prompts.
             self.backend.sync_weights()
+            if self.state is not None:
+                # vLLM owns an independent RNG: a saved request counter makes resumed sampling reproducible.
+                self.backend.generation_kwargs["seed"] = (self.seed + self.state.rollout_calls) % (2**31)
             _, completion_ids, _, _ = self.backend.generate(
-                prompts=prompt_ids, images=None, num_generations=1,
+                prompts=prompt_ids, images=None, num_generations=self.num_generations,
             )
-        return pack_completions(inputs, completion_ids, self.pad_token_id)
+        packed = pack_completions(inputs, completion_ids, self.pad_token_id)
+        if self.state is not None:
+            self.state.rollout_calls += 1
+        return packed
 
     def close(self):
         # The shell owns the server process; training only closes its NCCL connection.
@@ -68,6 +82,8 @@ def pack_completions(inputs, completions, pad_token_id):
     from torch.nn.utils.rnn import pad_sequence
 
     prompts = inputs["prompts"]
+    if len(completions) != len(prompts) or any(not ids for ids in completions):
+        raise ValueError("vLLM must return one nonempty completion per repeated prompt")
     tensors = [torch.tensor(ids, dtype=prompts.dtype, device=prompts.device) for ids in completions]
     completion_ids = pad_sequence(tensors, batch_first=True, padding_value=pad_token_id)
     completion_mask = pad_sequence(

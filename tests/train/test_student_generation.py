@@ -21,6 +21,9 @@ class Tensor(np.ndarray):
     def clone(self):
         return self.copy()
 
+    def repeat_interleave(self, repeats, dim):
+        return np.repeat(self, repeats, axis=dim).view(Tensor)
+
 
 def tensor(data, dtype=None, device=None):
     return np.array(data, dtype=dtype).view(Tensor)
@@ -112,6 +115,27 @@ class StudentGenerationTests(unittest.TestCase):
             self.generator.generate(self.inputs)
         self.backend.generate.assert_not_called()
 
+    def test_multiple_rollouts_keep_prompt_and_completion_order(self):
+        self.generator.num_generations = 2
+        self.backend.generate.return_value = (None, [[6], [7, 9], [8], [10]], None, None)
+        ids, mask, labels, _ = self.generator.generate(self.inputs)
+        self.assertEqual(self.backend.generate.call_args.kwargs['prompts'], [[9, 3], [9, 3], [4, 9, 5], [4, 9, 5]])
+        self.assertEqual(self.backend.generate.call_args.kwargs['num_generations'], 2)
+        np.testing.assert_array_equal(ids[:, :3], [[9, 9, 3], [9, 9, 3], [4, 9, 5], [4, 9, 5]])
+        self.assertEqual((labels[:, 1:] != -100).sum(), 5)
+
+    def test_resumed_vllm_request_uses_saved_counter_for_sampling_seed(self):
+        self.generator.state = SimpleNamespace(rollout_calls=45)
+        self.backend.generation_kwargs = {}
+        self.backend.generate.return_value = (None, [[7, 9], [8]], None, None)
+        self.generator.generate(self.inputs)
+        self.assertEqual(self.backend.generation_kwargs['seed'], 42 + 45)
+        self.assertEqual(self.generator.state.rollout_calls, 46)
+        self.backend.sync_weights.side_effect = RuntimeError('sync failed')
+        with self.assertRaises(RuntimeError):
+            self.generator.generate(self.inputs)
+        self.assertEqual(self.generator.state.rollout_calls, 46)
+
     def test_close_only_releases_communicator(self):
         self.generator.close()
         self.generator.close()
@@ -159,7 +183,10 @@ class LoraSyncTests(unittest.TestCase):
         import torch
         from peft import LoraConfig, get_peft_model
         from transformers import Qwen3Config, Qwen3ForCausalLM
-        from trl.generation.vllm_generation import VLLMGeneration
+        # This CPU test never creates a vLLM engine. The repository's vllm/ directory
+        # can otherwise be mistaken for an installed namespace package on macOS.
+        with patch('trl.import_utils.is_vllm_available', return_value=False):
+            from trl.generation.vllm_generation import VLLMGeneration
 
         config = Qwen3Config(
             vocab_size=23, hidden_size=32, intermediate_size=64, num_hidden_layers=1,

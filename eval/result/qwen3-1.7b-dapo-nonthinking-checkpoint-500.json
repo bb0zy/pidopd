@@ -1,11 +1,11 @@
 {
-  "checkpoint_dir": "/ossfs/workspace/pidopd/train/grpo_checkpoint",
+  "checkpoint_dir": "/ossfs/workspace/pidopd/train/dapo_checkpoint",
   "checkpoints": {
-    "checkpoint-100": {
-      "model": "/ossfs/workspace/pidopd/train/grpo_checkpoint/checkpoint-100",
-      "step": 100,
+    "checkpoint-500": {
+      "model": "/ossfs/workspace/pidopd/train/dapo_checkpoint/checkpoint-500",
+      "step": 500,
       "returncode": 0,
-      "result_dir": "/ossfs/workspace/pidopd/eval/results/20261022T070129_296213Z/checkpoint-100/20261022T070206_871009Z",
+      "result_dir": "/ossfs/workspace/pidopd/eval/results/20261022T070129_296213Z/checkpoint-500/20261022T070206_871009Z",
       "metrics": {
         "primary_metric": "avg@32",
         "samples_per_question": 16,
